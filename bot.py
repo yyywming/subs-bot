@@ -69,6 +69,11 @@ from convert import (
 from db import Store, nodes_of
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# httpx/httpcore 在 INFO 级会把每次请求的完整 URL 打进日志，而 Telegram 的 URL
+# 里嵌着 bot token —— 长轮询每 10 秒一次，等于把凭据反复写进 journal（实测 24h
+# 8440 行、journal 涨到 249MB）。降到 WARNING：出错照样记，正常请求不再刷。
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("subs-bot")
 # httpx 每次 getUpdates 都打一行 INFO, 5 天堆 3 万行/5.4M, 只留 WARNING
 logging.getLogger("httpx").setLevel(logging.WARNING)
