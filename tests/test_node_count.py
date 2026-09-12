@@ -245,12 +245,21 @@ async def test_fat_row_perf() -> None:
     t_fat = await timeit(lambda: st.list_subs(1))
     t_thin = await timeit(lambda: st.list_subs_meta(1))
     t_cnt = await timeit(lambda: st.count_subs(1))
+    fat_rows = await st.list_subs(1)
+    thin_rows = await st.list_subs_meta(1)
+    fat_bytes = len(json.dumps(fat_rows, ensure_ascii=False).encode())
+    thin_bytes = len(json.dumps(thin_rows, ensure_ascii=False).encode())
     print(f"  list_subs      (SELECT *) : {t_fat:7.1f} ms")
     print(f"  list_subs_meta (瘦查询)    : {t_thin:7.1f} ms")
     print(f"  count_subs     (COUNT(*)) : {t_cnt:7.1f} ms")
-    check("瘦查询显著更快", t_thin < t_fat * 0.5, f"{t_fat:.1f}ms -> {t_thin:.1f}ms")
+    print(f"  Python 返回体积           : {fat_bytes / 1024:.1f}KB -> {thin_bytes / 1024:.1f}KB")
+    # 微秒级热缓存计时受宿主负载影响，不能拿“必须快 2 倍”当 CI 门禁。
+    # 真正确定性的收益是：nodes_json 根本没有从 SQLite 搬进 Python。
+    check("瘦查询绝不返回 nodes_json", all("nodes_json" not in r for r in thin_rows))
+    check("瘦查询返回体积至少缩小 10 倍", thin_bytes * 10 < fat_bytes,
+          f"{fat_bytes} -> {thin_bytes} bytes")
     check("瘦查询仍报出正确节点数",
-          max(r["node_count"] for r in await st.list_subs_meta(1)) == FAT_NODES)
+          max(r["node_count"] for r in thin_rows) == FAT_NODES)
     check("count_subs 行数正确", await st.count_subs(1) == 9)
 
     # 删除/恢复巨型行也不该把 payload 搬进 Python
