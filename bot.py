@@ -75,9 +75,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("subs-bot")
-# httpx 每次 getUpdates 都打一行 INFO, 5 天堆 3 万行/5.4M, 只留 WARNING
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 store = Store()
 
