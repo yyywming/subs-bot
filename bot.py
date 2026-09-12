@@ -335,10 +335,22 @@ def looks_like_host_name(name: str | None) -> bool:
     return False
 
 
-async def refresh_sub(user_id: int, sub: dict[str, Any], rename: bool = False) -> dict[str, Any]:
+async def refresh_sub(
+    user_id: int,
+    sub: dict[str, Any],
+    rename: bool = False,
+    meta_only: bool = False,
+) -> dict[str, Any]:
+    """抓订阅并落库。
+
+    meta_only=True 时返回瘦行（不含 nodes_json，节点数在 node_count 键）。
+    默认行为会把刚写进去的 nodes_json 再读回来，巨型订阅下等于白搬几十 MB；
+    只需要节点数的调用方应该开这个开关，然后读 node_count 而不是 nodes_of()。
+    """
     nodes, meta, err = await fetch_subscription(sub["url"])
     fields: dict[str, Any] = {
         "nodes_json": json.dumps(nodes, ensure_ascii=False),
+        "node_count": len(nodes),
         "last_error": err,
         "traffic_used": meta.get("traffic_used"),
         "traffic_total": meta.get("traffic_total"),
@@ -347,12 +359,20 @@ async def refresh_sub(user_id: int, sub: dict[str, Any], rename: bool = False) -
     profile_name = (meta.get("profile_name") or "").strip()
     if profile_name and (rename or looks_like_host_name(sub.get("name"))):
         fields["name"] = profile_name
-    updated = await store.update_sub(user_id, int(sub["id"]), **fields)
-    return updated or sub
+    updated = await store.update_sub(
+        user_id, int(sub["id"]), return_meta=meta_only, **fields
+    )
+    if updated is None:
+        # 更新失败（行已被删等）时回退原行，但节点数用刚抓到的真实值补上，
+        # 免得调用方读到过期的 node_count。
+        fallback = dict(sub)
+        fallback["node_count"] = len(nodes)
+        return fallback
+    return updated
 
 
 async def render_list(user_id: int, page: int = 0, sort_mode: str = "默认") -> tuple[str, InlineKeyboardMarkup]:
-    subs = await store.list_subs(user_id)
+    subs = await store.list_subs_meta(user_id)
     if sort_mode == "流量":
         subs.sort(key=lambda s: (s.get("traffic_total") or 0) - (s.get("traffic_used") or 0), reverse=True)
     elif sort_mode == "到期":
@@ -480,7 +500,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_expire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
-    subs = await store.list_subs(update.effective_user.id)
+    subs = await store.list_subs_meta(update.effective_user.id)
     now = int(time.time())
     soon = []
     for i, sub in enumerate(subs, start=1):
@@ -508,11 +528,10 @@ async def cmd_update_all_ask(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if await deny(update):
         return
     user_id = update.effective_user.id
-    subs = await store.list_subs(user_id)
-    if not subs:
+    n = await store.count_subs(user_id)
+    if not n:
         await update.effective_message.reply_text("暂无订阅可更新。", reply_markup=MAIN_KB)
         return
-    n = len(subs)
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ 确认更新", callback_data="upd:run"),
@@ -533,7 +552,7 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     现在用 Semaphore(UPDATE_CONCURRENCY) 限流并发，墙钟时间从"累加"变成"最慢那条"。
     """
     user_id = update.effective_user.id
-    subs = await store.list_subs(user_id)
+    subs = await store.list_subs_meta(user_id)
     if not subs:
         await context.bot.send_message(chat_id=user_id, text="暂无订阅可更新。", reply_markup=MAIN_KB)
         return
@@ -574,7 +593,9 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         nonlocal done
         try:
             async with sem:
-                results[idx] = await refresh_sub(user_id, sub, rename=True)
+                results[idx] = await refresh_sub(
+                    user_id, sub, rename=True, meta_only=True
+                )
         except Exception as exc:
             # 单条炸掉不能拖垮整批，标成失败继续
             log.warning("refresh_sub failed for #%s: %s", sub.get("id"), exc)
@@ -803,7 +824,7 @@ async def cmd_delete_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not q:
         await update.effective_message.reply_text("用法：/d 关键词或订阅链接", reply_markup=MAIN_KB)
         return
-    subs = await store.list_subs(update.effective_user.id)
+    subs = await store.list_subs_meta(update.effective_user.id)
     hits = [s for s in subs if q in f"{s['name']} {s['url']}".lower()]
     if not hits:
         await update.effective_message.reply_text("没有匹配订阅。", reply_markup=MAIN_KB)
@@ -852,14 +873,18 @@ async def cmd_search_export(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if await deny(update):
         return
     q = " ".join(context.args or []).strip().lower()
-    subs = await store.list_subs(update.effective_user.id)
+    # 先用瘦行筛选，再只回取命中的完整节点数据。否则搜一个普通订阅也会先把
+    # 其它巨型订阅的几十 MB nodes_json 全搬进内存。
+    subs = await store.list_subs_meta(update.effective_user.id)
     hits = [s for s in subs if not q or q in f"{s['name']} {s['url']}".lower()]
     if not hits:
         await update.effective_message.reply_text("没有匹配订阅。", reply_markup=MAIN_KB)
         return
     nodes = []
-    for sub in hits:
-        nodes.extend(nodes_of(sub))
+    for hit in hits:
+        sub = await store.get_sub(update.effective_user.id, int(hit["id"]))
+        if sub is not None:
+            nodes.extend(nodes_of(sub))
     if not nodes:
         await update.effective_message.reply_text("匹配订阅暂无可导出节点。", reply_markup=MAIN_KB)
         return
@@ -877,7 +902,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not q:
         await update.effective_message.reply_text("用法：/s 关键词", reply_markup=MAIN_KB)
         return
-    subs = await store.list_subs(update.effective_user.id)
+    subs = await store.list_subs_meta(update.effective_user.id)
     hits = []
     for i, sub in enumerate(subs, start=1):
         blob = f"{sub['name']} {sub['url']}".lower()
@@ -1033,11 +1058,15 @@ async def cmd_temp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def show_detail(update: Update, user_id: int, idx: int, page: int = 0) -> None:
-    subs = await store.list_subs(user_id)
+    # 编号定位只需要元数据；完整 nodes_json 只取被点中的那一条。
+    subs = await store.list_subs_meta(user_id)
     if idx < 1 or idx > len(subs):
         await update.effective_message.reply_text("编号不存在。", reply_markup=MAIN_KB)
         return
-    sub = subs[idx - 1]
+    sub = await store.get_sub(user_id, int(subs[idx - 1]["id"]))
+    if not sub:
+        await update.effective_message.reply_text("订阅不存在或已被删除。", reply_markup=MAIN_KB)
+        return
     if not nodes_of(sub):
         sub = await refresh_sub(user_id, sub)
     nodes = nodes_of(sub)
@@ -1088,7 +1117,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not updated:
             await update.effective_message.reply_text("❌ 订阅不存在或已被删除。", reply_markup=MAIN_KB)
             return
-        subs = await store.list_subs(user_id)
+        subs = await store.list_subs_meta(user_id)
         idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == sub_id), sub_id)
         await update.effective_message.reply_html(
             f"✅ 订阅名称已更新为：<b>{html.escape(new_name)}</b>\n\n" + detail_text(updated, idx),
@@ -1106,7 +1135,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         page = int(text) - 1
         if page < 0:
             page = 0
-        subs_total = len(await store.list_subs(user_id))
+        subs_total = await store.count_subs(user_id)
         max_page = max(0, (subs_total - 1) // 8)
         if page > max_page:
             await update.effective_message.reply_text(
@@ -1242,24 +1271,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         name, url = [x.strip() for x in text.split("|", 1)]
         if re.match(r"^https?://", url):
             clean_url = url.rstrip("/")
-            existing = [s for s in await store.list_subs(user_id) if s["url"].rstrip("/") == clean_url]
+            existing = [s for s in await store.list_subs_meta(user_id) if s["url"].rstrip("/") == clean_url]
             if existing:
                 sub = existing[0]
                 if name:
                     await store.update_sub(user_id, int(sub["id"]), name=name)
-                sub = await refresh_sub(user_id, sub, rename=not bool(name))
-                subs = await store.list_subs(user_id)
+                sub = await refresh_sub(
+                    user_id, sub, rename=not bool(name), meta_only=True
+                )
+                subs = await store.list_subs_meta(user_id)
                 idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == int(sub["id"])), 1)
                 await update.effective_message.reply_html(
-                    f"🔄 <b>订阅已存在，已为您自动更新！</b>\n\n#{idx} <b>{html.escape(sub['name'])}</b>\n节点数: {len(nodes_of(sub))}",
+                    f"🔄 <b>订阅已存在，已为您自动更新！</b>\n\n#{idx} <b>{html.escape(sub['name'])}</b>\n节点数: {sub['node_count']}",
                     reply_markup=MAIN_KB,
                 )
                 return
 
             sub = await store.add_sub(user_id, name or urlparse(url).netloc or "订阅", url)
-            sub = await refresh_sub(user_id, sub, rename=not bool(name))
+            sub = await refresh_sub(
+                user_id, sub, rename=not bool(name), meta_only=True
+            )
             await update.effective_message.reply_html(
-                f"✅ 已添加订阅 <b>{html.escape(sub['name'])}</b>\n节点: {len(nodes_of(sub))}",
+                f"✅ 已添加订阅 <b>{html.escape(sub['name'])}</b>\n节点: {sub['node_count']}",
                 reply_markup=MAIN_KB,
             )
             return
@@ -1269,20 +1302,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if urls and not extract_share_links(text):
         added = []
         updated_list = []
-        existing_subs = await store.list_subs(user_id)
+        existing_subs = await store.list_subs_meta(user_id)
         existing_url_map = {s["url"].rstrip("/"): s for s in existing_subs}
 
         for url in urls:
             clean_url = url.rstrip("/")
             if clean_url in existing_url_map:
                 old_sub = existing_url_map[clean_url]
-                refreshed = await refresh_sub(user_id, old_sub, rename=True)
-                updated_list.append(f"{refreshed['name']} ({len(nodes_of(refreshed))} 节点)")
+                refreshed = await refresh_sub(
+                    user_id, old_sub, rename=True, meta_only=True
+                )
+                updated_list.append(f"{refreshed['name']} ({refreshed['node_count']} 节点)")
             else:
                 name = urlparse(url).netloc or "订阅"
                 sub = await store.add_sub(user_id, name, url)
-                sub = await refresh_sub(user_id, sub, rename=True)
-                added.append(f"{sub['name']} ({len(nodes_of(sub))} 节点)")
+                sub = await refresh_sub(user_id, sub, rename=True, meta_only=True)
+                added.append(f"{sub['name']} ({sub['node_count']} 节点)")
 
         msg_lines = []
         if added:
@@ -1336,7 +1371,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     user_id = update.effective_user.id
-    existing_urls = {sub["url"] for sub in await store.list_subs(user_id)}
+    existing_urls = {sub["url"] for sub in await store.list_subs_meta(user_id)}
     parsed_nodes = parse_nodes_from_text(text)
     structured = bool(parsed_nodes and ("proxies:" in text or "outbounds" in text))
     created: list[tuple[str, int]] = []
@@ -1347,7 +1382,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if structured:
         name = filename.rsplit("/", 1)[-1].rsplit(".", 1)[0][:64] or "导入配置"
         # 结构化配置去重：如果已有同名本地配置，直接更新其节点，避免重复创建
-        existing_imported = [s for s in await store.list_subs(user_id) if s.get("name") == name and s.get("url", "").startswith("uploaded://")]
+        existing_imported = [s for s in await store.list_subs_meta(user_id) if s.get("name") == name and s.get("url", "").startswith("uploaded://")]
         if existing_imported:
             old_sub = existing_imported[0]
             await store.update_sub(user_id, int(old_sub["id"]), nodes_json=json.dumps(parsed_nodes[:MAX_IMPORTED_NODES], ensure_ascii=False))
@@ -1356,26 +1391,30 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             local = await store.add_imported_sub(user_id, name, parsed_nodes[:MAX_IMPORTED_NODES])
             created.append((str(local["name"]), len(parsed_nodes[:MAX_IMPORTED_NODES])))
     else:
-        existing_url_norm = {sub["url"].rstrip("/"): sub for sub in await store.list_subs(user_id)}
+        existing_url_norm = {sub["url"].rstrip("/"): sub for sub in await store.list_subs_meta(user_id)}
         urls = _unique(value.rstrip(".,;:!?)]}>\"\'") for value in re.findall(r"https?://[^\s<>\"]+", text))
         for url in urls[:MAX_IMPORTED_SUBSCRIPTIONS]:
             clean_url = url.rstrip("/")
             if clean_url in existing_url_norm:
                 old_sub = existing_url_norm[clean_url]
                 try:
-                    updated = await refresh_sub(user_id, old_sub, rename=True)
-                    created.append((f"{updated['name']} (已更新)", len(nodes_of(updated))))
+                    updated = await refresh_sub(
+                        user_id, old_sub, rename=True, meta_only=True
+                    )
+                    created.append((f"{updated['name']} (已更新)", updated['node_count']))
                 except Exception:
                     skipped += 1
                 continue
             name = urlparse(url).netloc or "订阅"
             try:
                 sub = await store.add_sub(user_id, name, url)
-                updated = await refresh_sub(user_id, sub, rename=True)
+                updated = await refresh_sub(
+                    user_id, sub, rename=True, meta_only=True
+                )
                 if updated.get("last_error"):
-                    failures.append(f"{name}: {updated["last_error"]}")
+                    failures.append(f"{name}: {updated['last_error']}")
                 else:
-                    created.append((str(updated.get("name") or name), len(nodes_of(updated))))
+                    created.append((str(updated.get("name") or name), updated['node_count']))
             except Exception as exc:
                 failures.append(f"{name}: {exc}")
         links = _unique(extract_share_links(text))[:MAX_IMPORTED_NODES]
@@ -1525,8 +1564,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await q.edit_message_text(prefix + page_text, parse_mode=ParseMode.HTML, reply_markup=page_kb)
         return
     if data == "list:updateall":
-        subs = await store.list_subs(user_id)
-        n = len(subs)
+        n = await store.count_subs(user_id)
         if not n:
             await q.message.reply_text("暂无订阅可更新。", reply_markup=MAIN_KB)
             return
@@ -1563,7 +1601,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await q.edit_message_text("已保留失效订阅。", reply_markup=keep_kb)
         return
     if data == "upd:delfailed":
-        subs = await store.list_subs(user_id)
+        subs = await store.list_subs_meta(user_id)
         removed = 0
         for sub in subs:
             if sub.get("last_error"):
@@ -1593,7 +1631,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         if not nodes_of(sub):
             sub = await refresh_sub(user_id, sub, rename=True)
-        subs = await store.list_subs(user_id)
+        subs = await store.list_subs_meta(user_id)
         idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == sub_id), sub_id)
         await q.edit_message_text(
             detail_text(sub, idx),
@@ -1701,7 +1739,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         sub = await refresh_sub(user_id, sub, rename=True)
         # find display index
-        subs = await store.list_subs(user_id)
+        subs = await store.list_subs_meta(user_id)
         idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == sub_id), sub_id)
         await q.edit_message_text(
             detail_text(sub, idx),
@@ -1959,7 +1997,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     share_parsed = parse_share_query(raw_query)
     if share_parsed:
         max_views, target_user_id, duration_minutes, content = share_parsed
-        subs = await store.list_subs(user_id)
+        subs = await store.list_subs_meta(user_id)
         results: list[InlineQueryResultArticle] = []
 
         # 1. 寻找可能匹配的订阅列表 (候选池)
@@ -2061,7 +2099,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     q = raw_query.lower()
     sort_mode = (context.user_data or {}).get("sort_mode", "默认")
-    subs = await store.list_subs(user_id)
+    subs = await store.list_subs_meta(user_id)
     if sort_mode == "流量":
         subs.sort(key=lambda s: (s.get("traffic_total") or 0) - (s.get("traffic_used") or 0), reverse=True)
     elif sort_mode == "到期":

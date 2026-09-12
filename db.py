@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -10,6 +11,26 @@ from typing import Any, AsyncIterator
 import aiosqlite
 
 from config import DB_PATH
+
+log = logging.getLogger("subs-bot.db")
+
+# meta 表里的一次性迁移标记位
+_BACKFILL_FLAG = "node_count_backfilled_v1"
+
+# 瘦查询列：subscriptions 的全部列减去 nodes_json。
+# 显式写死而不是 SELECT * —— 巨型订阅的 nodes_json 单行可达数十 MB，
+# 列表页/更新流程只需要元信息，把它读出来纯属浪费（实测 83.6MB / 293ms）。
+# 节点数由维护型 node_count 列给出，不再靠解析 JSON。
+_META_COLS = (
+    "id, user_id, name, url, token, expire_at, traffic_used, "
+    "traffic_total, node_count, last_error, created_at, updated_at"
+)
+
+# 回收站列表同理：只显示名字，没必要把已删订阅的节点也拖出来
+_DELETED_META_COLS = (
+    "id, user_id, name, url, token, expire_at, traffic_used, "
+    "traffic_total, node_count, last_error, created_at, deleted_at"
+)
 
 
 SCHEMA = """
@@ -23,6 +44,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     traffic_used REAL,
     traffic_total REAL,
     nodes_json TEXT NOT NULL DEFAULT '[]',
+    node_count INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -57,6 +79,7 @@ CREATE TABLE IF NOT EXISTS deleted_subs (
     traffic_used REAL,
     traffic_total REAL,
     nodes_json TEXT NOT NULL DEFAULT '[]',
+    node_count INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     created_at INTEGER NOT NULL,
     deleted_at INTEGER NOT NULL
@@ -87,6 +110,15 @@ CREATE TABLE IF NOT EXISTS share_claims (
 """
 
 
+def _count_nodes_json(raw: str | None) -> int:
+    """数一段 nodes_json 里的节点数。坏数据算 0，不抛异常。"""
+    try:
+        data = json.loads(raw or "[]")
+    except Exception:
+        return 0
+    return len(data) if isinstance(data, list) else 0
+
+
 class Store:
     """单连接 + 一次性建表的 SQLite 存储层。
 
@@ -113,17 +145,64 @@ class Store:
         db = await aiosqlite.connect(self.path)
         db.row_factory = aiosqlite.Row
         await db.executescript(SCHEMA)
-        # 安全迁移：为现有数据库补全 inline_message_id 列（列已存在时抛错属正常）
-        try:
-            await db.execute("ALTER TABLE shares ADD COLUMN inline_message_id TEXT")
-        except Exception:
-            pass
+        # 安全迁移：为现有数据库补全后加的列（列已存在时抛错属正常）
+        for table, col, decl in (
+            ("shares", "inline_message_id", "TEXT"),
+            ("subscriptions", "node_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("deleted_subs", "node_count", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            try:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            except Exception:
+                pass
         # WAL 让读写不再互相阻塞；NORMAL 省掉每次提交的 fsync 往返
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
         await db.commit()
+        await self._backfill_node_count(db)
         self._conn = db
         self._ready = True
+
+    async def _backfill_node_count(self, db: aiosqlite.Connection) -> None:
+        """给历史数据回填 node_count。只跑一次，靠 meta 表记标记位。
+
+        注意：必须直接收 db 参数，不能走 self.connection() —— 本方法由 init()
+        在锁内调用，再去拿锁会死锁。
+
+        为什么要标记位：node_count 默认 0，单看值无法区分"真的 0 个节点"和
+        "老数据还没回填"。用 meta 记一笔，之后每次启动只是一次主键查询。
+        """
+        cur = await db.execute("SELECT value FROM meta WHERE key=?", (_BACKFILL_FLAG,))
+        if await cur.fetchone():
+            return
+
+        for table in ("subscriptions", "deleted_subs"):
+            try:
+                # 走 SQL 一条语句搞定；json_valid 挡住脏数据，避免整批迁移崩掉
+                await db.execute(
+                    f"""UPDATE {table} SET node_count = CASE
+                        WHEN json_valid(nodes_json) THEN json_array_length(nodes_json)
+                        ELSE 0 END"""
+                )
+            except Exception as exc:
+                # 这个 SQLite 没编 json1，退回 Python 逐行数（慢但一次性）
+                log.warning("json1 unavailable on %s (%s), falling back to Python", table, exc)
+                cur = await db.execute(f"SELECT id, nodes_json FROM {table}")
+                for row in await cur.fetchall():
+                    try:
+                        data = json.loads(row["nodes_json"] or "[]")
+                        n = len(data) if isinstance(data, list) else 0
+                    except Exception:
+                        n = 0
+                    await db.execute(
+                        f"UPDATE {table} SET node_count=? WHERE id=?", (n, row["id"])
+                    )
+
+        await db.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (_BACKFILL_FLAG, "1")
+        )
+        await db.commit()
+        log.info("node_count backfill completed")
 
     async def close(self) -> None:
         """关闭共享连接，供进程退出时收尾。"""
@@ -145,12 +224,46 @@ class Store:
             yield self._conn
 
     async def list_subs(self, user_id: int) -> list[dict[str, Any]]:
+        """完整行，含 nodes_json。只在真要用节点数据时调（导出/聚合/详情）。"""
         async with self.connection() as db:
             cur = await db.execute(
                 "SELECT * FROM subscriptions WHERE user_id=? ORDER BY id ASC", (user_id,)
             )
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+
+    async def list_subs_meta(self, user_id: int) -> list[dict[str, Any]]:
+        """瘦查询：不含 nodes_json，节点数走 node_count 列。
+
+        列表页、到期统计、批量更新这些场景都不需要节点明细。巨型订阅下
+        SELECT * 要搬几十 MB，这里是常数级。返回的字典没有 nodes_json 键，
+        误传给 nodes_of() 会直接抛 KeyError（故意的，见 nodes_of 注释）。
+        """
+        async with self.connection() as db:
+            cur = await db.execute(
+                f"SELECT {_META_COLS} FROM subscriptions WHERE user_id=? ORDER BY id ASC",
+                (user_id,),
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def get_sub_meta(self, user_id: int, sub_id: int) -> dict[str, Any] | None:
+        """单条瘦查询，语义同 list_subs_meta。"""
+        async with self.connection() as db:
+            cur = await db.execute(
+                f"SELECT {_META_COLS} FROM subscriptions WHERE user_id=? AND id=?",
+                (user_id, sub_id),
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def count_subs(self, user_id: int) -> int:
+        """只数行数，不读任何 payload。"""
+        async with self.connection() as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) AS n FROM subscriptions WHERE user_id=?", (user_id,)
+            )
+            row = await cur.fetchone()
+            return int(row["n"]) if row else 0
 
     async def get_sub(self, user_id: int, sub_id: int) -> dict[str, Any] | None:
         async with self.connection() as db:
@@ -182,16 +295,32 @@ class Store:
         assert sub is not None
         return sub
 
-    async def update_sub(self, user_id: int, sub_id: int, **fields: Any) -> dict[str, Any] | None:
+    async def update_sub(
+        self, user_id: int, sub_id: int, *, return_meta: bool = False, **fields: Any
+    ) -> dict[str, Any] | None:
+        """更新订阅字段。
+
+        写 nodes_json 时自动同步 node_count —— 放在这里而不是让调用方各自维护，
+        是因为漏一处就会让节点数长期显示错值，且很难发现。
+
+        return_meta=True 时回瘦行（不含 nodes_json）。巨型订阅下默认行为等于
+        "写完几十 MB 再读回几十 MB"，只想拿回节点数的调用方应该开这个开关。
+        """
         if not fields:
-            return await self.get_sub(user_id, sub_id)
+            return await (self.get_sub_meta if return_meta else self.get_sub)(user_id, sub_id)
         allowed = {
             "name", "url", "token", "expire_at", "traffic_used",
-            "traffic_total", "nodes_json", "last_error", "created_at",
+            "traffic_total", "nodes_json", "node_count", "last_error", "created_at",
         }
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"unsupported subscription fields: {sorted(unknown)}")
+        if "nodes_json" in fields and "node_count" not in fields:
+            # 普通小调用方不传 node_count 时仍自动维护；巨型刷新路径会直接
+            # 传入已知的 len(nodes)，避免把刚序列化的几十 MB JSON 再解析一遍。
+            fields["node_count"] = _count_nodes_json(fields["nodes_json"])
+        if "node_count" in fields:
+            fields["node_count"] = max(0, int(fields["node_count"]))
         fields["updated_at"] = int(time.time())
         cols = ", ".join(f"{k}=?" for k in fields)
         vals = list(fields.values()) + [user_id, sub_id]
@@ -200,32 +329,28 @@ class Store:
                 f"UPDATE subscriptions SET {cols} WHERE user_id=? AND id=?", vals
             )
             await db.commit()
-        return await self.get_sub(user_id, sub_id)
+        return await (self.get_sub_meta if return_meta else self.get_sub)(user_id, sub_id)
 
     async def delete_sub(self, user_id: int, sub_id: int) -> bool:
-        sub = await self.get_sub(user_id, sub_id)
-        if not sub:
-            return False
+        """软删除：整行搬进 deleted_subs。
+
+        旧实现先 get_sub() 把整行（含几十 MB 的 nodes_json）读进 Python，再原样
+        INSERT 回去，等于让巨型 payload 在进程内跑一趟往返。改成 INSERT..SELECT，
+        数据全程留在 SQLite 内部。
+        """
         now = int(time.time())
         async with self.connection() as db:
-            await db.execute(
+            cur = await db.execute(
                 """INSERT INTO deleted_subs
-                (user_id,name,url,token,expire_at,traffic_used,traffic_total,nodes_json,last_error,created_at,deleted_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    user_id,
-                    sub["name"],
-                    sub["url"],
-                    sub["token"],
-                    sub["expire_at"],
-                    sub["traffic_used"],
-                    sub["traffic_total"],
-                    sub["nodes_json"],
-                    sub["last_error"],
-                    sub["created_at"],
-                    now,
-                ),
+                (user_id,name,url,token,expire_at,traffic_used,traffic_total,
+                 nodes_json,node_count,last_error,created_at,deleted_at)
+                SELECT user_id,name,url,token,expire_at,traffic_used,traffic_total,
+                       nodes_json,node_count,last_error,created_at,?
+                FROM subscriptions WHERE user_id=? AND id=?""",
+                (now, user_id, sub_id),
             )
+            if cur.rowcount <= 0:
+                return False
             cur = await db.execute(
                 "DELETE FROM subscriptions WHERE user_id=? AND id=?", (user_id, sub_id)
             )
@@ -233,52 +358,52 @@ class Store:
             return cur.rowcount > 0
 
     async def list_deleted(self, user_id: int, days: int = 30) -> list[dict[str, Any]]:
+        """回收站列表，瘦查询（不含 nodes_json）。
+
+        唯一调用方 cmd_recycle 只显示名字。恢复走 restore_deleted 的纯 SQL
+        行拷贝，节点数据全程留在 SQLite 里，不需要经过这里。
+        """
         cutoff = int(time.time()) - days * 86400
         async with self.connection() as db:
             cur = await db.execute(
-                "SELECT * FROM deleted_subs WHERE user_id=? AND deleted_at>=? ORDER BY deleted_at DESC",
+                f"""SELECT {_DELETED_META_COLS} FROM deleted_subs
+                    WHERE user_id=? AND deleted_at>=? ORDER BY deleted_at DESC""",
                 (user_id, cutoff),
             )
             return [dict(r) for r in await cur.fetchall()]
 
     async def restore_deleted(self, user_id: int, deleted_id: int) -> dict[str, Any] | None:
+        """从回收站恢复。同 delete_sub，用 INSERT..SELECT 避免搬运 payload。
+
+        返回瘦行（不含 nodes_json）：调用方只用来显示名字。
+        """
+        now = int(time.time())
+        fallback_token = secrets.token_urlsafe(12)
         async with self.connection() as db:
             cur = await db.execute(
-                "SELECT * FROM deleted_subs WHERE user_id=? AND id=?", (user_id, deleted_id)
-            )
-            row = await cur.fetchone()
-            if not row:
-                return None
-            item = dict(row)
-            now = int(time.time())
-            token = item["token"] or secrets.token_urlsafe(12)
-            await db.execute(
                 """INSERT INTO subscriptions
-                (user_id,name,url,token,expire_at,traffic_used,traffic_total,nodes_json,last_error,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    user_id,
-                    item["name"],
-                    item["url"],
-                    token,
-                    item["expire_at"],
-                    item["traffic_used"],
-                    item["traffic_total"],
-                    item["nodes_json"],
-                    item["last_error"],
-                    item["created_at"],
-                    now,
-                ),
+                (user_id,name,url,token,expire_at,traffic_used,traffic_total,
+                 nodes_json,node_count,last_error,created_at,updated_at)
+                SELECT user_id,name,url,
+                       COALESCE(NULLIF(token,''), ?),
+                       expire_at,traffic_used,traffic_total,
+                       nodes_json,node_count,last_error,created_at,?
+                FROM deleted_subs WHERE user_id=? AND id=?""",
+                (fallback_token, now, user_id, deleted_id),
             )
+            if cur.rowcount <= 0:
+                return None
+            # 用 lastrowid 精确定位刚插入的行；旧实现取 list_subs()[-1]，
+            # 依赖"最后一条就是刚恢复的"这个并不成立的假设。
+            new_id = int(cur.lastrowid)
             await db.execute("DELETE FROM deleted_subs WHERE id=?", (deleted_id,))
             await db.commit()
-        subs = await self.list_subs(user_id)
-        return subs[-1] if subs else None
+        return await self.get_sub_meta(user_id, new_id)
 
     async def renumber(self, user_id: int) -> int:
         # Display numbers are derived from ORDER BY id; never rewrite rows here.
         # Re-inserting would invalidate callback IDs and unnecessarily risk data loss.
-        return len(await self.list_subs(user_id))
+        return await self.count_subs(user_id)
 
     async def add_imported_sub(
         self, user_id: int, name: str, nodes: list[dict[str, Any]]
@@ -289,11 +414,12 @@ class Store:
         async with self.connection() as db:
             cur = await db.execute(
                 """INSERT INTO subscriptions
-                (user_id,name,url,token,expire_at,traffic_used,traffic_total,nodes_json,created_at,updated_at)
-                VALUES (?,?,?,?,NULL,NULL,NULL,?,?,?)""",
+                (user_id,name,url,token,expire_at,traffic_used,traffic_total,
+                 nodes_json,node_count,created_at,updated_at)
+                VALUES (?,?,?,?,NULL,NULL,NULL,?,?,?,?)""",
                 (
                     user_id, name[:64] or "导入配置", local_url, token,
-                    json.dumps(nodes, ensure_ascii=False), now, now,
+                    json.dumps(nodes, ensure_ascii=False), len(nodes), now, now,
                 ),
             )
             await db.commit()
@@ -457,8 +583,23 @@ class Store:
 
 
 def nodes_of(sub: dict[str, Any]) -> list[dict[str, Any]]:
+    """解析节点明细。
+
+    故意在缺 nodes_json 键时抛 KeyError：那意味着调用方拿的是 list_subs_meta /
+    get_sub_meta 的瘦行，而瘦行是没有节点数据的。旧实现用 .get() 兜底会静默
+    返回 []，把"我传错了行类型"这个编程错误伪装成"这条订阅 0 个节点"——
+    界面上看到的就是节点数莫名变 0，比直接崩难查得多。
+
+    JSON 本身坏掉是另一回事（数据问题，不是调用错误），仍然容错返回 []。
+    只想要节点数量时别用 len(nodes_of(sub))，直接读 sub["node_count"]。
+    """
+    if "nodes_json" not in sub:
+        raise KeyError(
+            "nodes_of() 收到不含 nodes_json 的瘦行（来自 list_subs_meta/get_sub_meta）。"
+            "需要节点明细请改用 list_subs()/get_sub()；只要数量请读 sub['node_count']。"
+        )
     try:
-        data = json.loads(sub.get("nodes_json") or "[]")
+        data = json.loads(sub["nodes_json"] or "[]")
         return data if isinstance(data, list) else []
     except Exception:
         return []

@@ -93,8 +93,11 @@ async def main() -> None:
     cur = 0
     peak = 0
     order_seen: list[str] = []
+    meta_flags: list[bool] = []
 
-    async def fake_refresh(user_id, sub, rename=False):
+    async def fake_refresh(user_id, sub, rename=False, meta_only=False):
+        # run_update_all 必须显式请求瘦返回，否则巨型订阅会在写完后再回读几十 MB
+        meta_flags.append(meta_only is True)
         nonlocal cur, peak
         cur += 1
         peak = max(peak, cur)
@@ -121,6 +124,8 @@ async def main() -> None:
 
     serial = sum(_delay_of(i) for i in range(N))
     limit = B.UPDATE_CONCURRENCY
+    check("12 个 worker 全部请求 meta_only=True",
+          len(meta_flags) == N and all(meta_flags), f"{sum(meta_flags)}/{len(meta_flags)}")
     check("并发峰值不超过 Semaphore 上限", peak <= limit, f"peak={peak} limit={limit}")
     check("确实并发了(峰值>1)", peak > 1, f"peak={peak}")
     check("墙钟远快于串行", wall < serial * 0.6, f"wall={wall:.2f}s 串行={serial:.2f}s")
@@ -147,7 +152,10 @@ async def main() -> None:
 
     # ── 2. 异常隔离 ──────────────────────────────────────────────────────────
     print("=== 2. 单条抛异常不拖垮整批 ===")
-    async def boom_refresh(user_id, sub, rename=False):
+    boom_meta_flags: list[bool] = []
+
+    async def boom_refresh(user_id, sub, rename=False, meta_only=False):
+        boom_meta_flags.append(meta_only is True)
         if int(sub["name"][-2:]) == 5:
             raise RuntimeError("network exploded")
         return {**sub, "last_error": None}
@@ -155,6 +163,9 @@ async def main() -> None:
     B.refresh_sub = boom_refresh
     msg2, bot2 = FakeMsg(), FakeBot()
     await B.run_update_all(FakeUpdate(FakeCbq(msg2)), FakeCtx(bot2))
+    check("异常隔离轮也全部请求 meta_only=True",
+          len(boom_meta_flags) == N and all(boom_meta_flags),
+          f"{sum(boom_meta_flags)}/{len(boom_meta_flags)}")
     check("异常条数不为 0 时整批仍完成", len(bot2.docs) == 3, str(bot2.docs))
     done_txt = [e for e in msg2.edits if "更新完成" in e]
     check("末条消息是更新完成", bool(done_txt), done_txt[-1] if done_txt else "无")
