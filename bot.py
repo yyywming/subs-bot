@@ -70,6 +70,9 @@ from db import Store, nodes_of
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("subs-bot")
+# httpx 每次 getUpdates 都打一行 INFO, 5 天堆 3 万行/5.4M, 只留 WARNING
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 store = Store()
 
