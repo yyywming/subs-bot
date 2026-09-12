@@ -44,4 +44,6 @@ DB_PATH = Path(os.environ.get("DB_PATH", str(DATA_DIR / "subs.db")))
 MAX_DOCUMENT_BYTES = _env_int("MAX_DOCUMENT_BYTES", 10 * 1024 * 1024, 1, 50 * 1024 * 1024)
 MAX_IMPORTED_NODES = _env_int("MAX_IMPORTED_NODES", 500, 1, 5000)
 MAX_IMPORTED_SUBSCRIPTIONS = _env_int("MAX_IMPORTED_SUBSCRIPTIONS", 20, 1, 100)
+# 批量更新订阅的并发上限。太高会让机场把并发请求当刷探测，8 是实测稳妥值。
+UPDATE_CONCURRENCY = _env_int("UPDATE_CONCURRENCY", 8, 1, 32)
 DATA_DIR.mkdir(parents=True, exist_ok=True)

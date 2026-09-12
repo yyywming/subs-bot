@@ -18,6 +18,7 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
     InputTextMessageContent,
+    LinkPreviewOptions,
     ReplyKeyboardMarkup,
     InputFile,
     Update,
@@ -29,6 +30,7 @@ from telegram.ext import (
     ChosenInlineResultHandler,
     CommandHandler,
     ContextTypes,
+    Defaults,
     InlineQueryHandler,
     MessageHandler,
     filters,
@@ -45,9 +47,11 @@ from config import (
     MAX_IMPORTED_NODES,
     MAX_IMPORTED_SUBSCRIPTIONS,
     PUBLIC_BASE_URL,
+    UPDATE_CONCURRENCY,
 )
 from convert import (
     apply_path_maps,
+    close_session,
     extract_share_links,
     fetch_subscription,
     format_bytes_gb,
@@ -517,12 +521,73 @@ async def cmd_update_all_ask(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """执行批量更新，发送结果文件并统计失效订阅。"""
+    """并发批量更新，实时刷进度，发送结果文件并统计失效订阅。
+
+    旧实现是串行 for 循环：fetch_subscription 默认 25s 超时，20 条订阅里只要
+    有 3 条死链就得干等 75s+，而这期间界面上一个字都不动，用户只会以为 bot 死了。
+    现在用 Semaphore(UPDATE_CONCURRENCY) 限流并发，墙钟时间从"累加"变成"最慢那条"。
+    """
     user_id = update.effective_user.id
     subs = await store.list_subs(user_id)
+    if not subs:
+        await context.bot.send_message(chat_id=user_id, text="暂无订阅可更新。", reply_markup=MAIN_KB)
+        return
+
+    total = len(subs)
+    started = time.monotonic()
+
+    # 进度条挂在触发这次更新的那条消息上（upd:run 回调刚编辑过它）
+    progress_msg = None
+    if update.callback_query is not None:
+        progress_msg = update.callback_query.message
+
+    done = 0
+    last_edit = 0.0
+    last_text = ""
+
+    async def _flush_progress(force: bool = False) -> None:
+        """刷新进度条。节流 1.5s，避免撞 Telegram 的 editMessageText 限频。"""
+        nonlocal last_edit, last_text
+        if progress_msg is None:
+            return
+        now = time.monotonic()
+        if not force and now - last_edit < 1.5:
+            return
+        filled = int(done / total * 10) if total else 10
+        bar = "▓" * filled + "░" * (10 - filled)
+        text = f"🔄 正在更新订阅…\n\n{bar} {done}/{total}"
+        if text == last_text:
+            return
+        last_edit, last_text = now, text
+        with suppress(Exception):  # 限频/消息未变更都不该中断更新
+            await progress_msg.edit_text(text)
+
+    sem = asyncio.Semaphore(max(1, UPDATE_CONCURRENCY))
+    results: list[dict[str, Any] | None] = [None] * total
+
+    async def _worker(idx: int, sub: dict[str, Any]) -> None:
+        nonlocal done
+        try:
+            async with sem:
+                results[idx] = await refresh_sub(user_id, sub, rename=True)
+        except Exception as exc:
+            # 单条炸掉不能拖垮整批，标成失败继续
+            log.warning("refresh_sub failed for #%s: %s", sub.get("id"), exc)
+            results[idx] = {**sub, "last_error": str(exc)}
+        finally:
+            done += 1
+        await _flush_progress()
+
+    await _flush_progress(force=True)
+    await asyncio.gather(*(_worker(i, s) for i, s in enumerate(subs)))
+    await _flush_progress(force=True)
+
+    elapsed = time.monotonic() - started
+
     valid, drained, expired, failed = [], [], [], []
-    for sub in subs:
-        updated = await refresh_sub(user_id, sub, rename=True)
+    for updated in results:
+        if updated is None:
+            continue
         if updated.get("last_error"):
             failed.append(updated)
         elif updated.get("traffic_total") and remain_traffic_gb(updated) == 0:
@@ -531,6 +596,11 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             expired.append(updated)
         else:
             valid.append(updated)
+
+    if progress_msg is not None:
+        with suppress(Exception):
+            await progress_msg.edit_text(f"✅ 更新完成，共 {total} 条，耗时 {elapsed:.1f}s")
+
     # 生成结果文件
     def _fmt_rows(rows: list[dict[str, Any]]) -> str:
         out = []
@@ -2040,7 +2110,13 @@ async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_
 
 
 def build_app() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
+    # 全局关掉链接预览：这个 bot 发的几乎全是订阅链接/节点列表/GitHub 链接，
+    # Telegram 自动拽出来的预览卡纯属噪音。在 Defaults 里设一次，省掉逐个调用点传参
+    # （已显式传 disable_web_page_preview 的 18 处照旧生效，互斥检查在调用层先跑，不冲突）。
+    # 注意：绝不在这里设全局 parse_mode —— 大量 reply_text 发的是纯文本提示，
+    # 一旦被当 HTML 解析，用户输入里带个 < 或 & 就会让整条消息发送失败。
+    defaults = Defaults(link_preview_options=LinkPreviewOptions(is_disabled=True))
+    app = Application.builder().token(BOT_TOKEN).defaults(defaults).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("list", cmd_list))
@@ -2066,6 +2142,8 @@ def build_app() -> Application:
 
 async def amain() -> None:
     app = build_app()
+    # 先把建表/迁移一次性做完，之后所有查询共享同一条连接
+    await store.init()
     runner = await start_http(app)
     try:
         log.info("Bot starting...")
@@ -2094,6 +2172,10 @@ async def amain() -> None:
             await app.shutdown()
         with suppress(Exception):
             await runner.cleanup()
+        with suppress(Exception):
+            await store.close()
+        with suppress(Exception):
+            await close_session()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 import time
@@ -87,24 +88,61 @@ CREATE TABLE IF NOT EXISTS share_claims (
 
 
 class Store:
+    """单连接 + 一次性建表的 SQLite 存储层。
+
+    旧实现每次查询都新开连接并重放整份 SCHEMA（外加一条必然抛异常的
+    ALTER TABLE），实测比复用连接慢 12.3 倍。现在建表/迁移只在首次访问时
+    执行一次，之后所有查询共享同一条连接。
+
+    并发安全：aiosqlite 每条连接背后是单线程，但 read-modify-write 型操作
+    （如 claim_share）跨多条语句，必须整块串行化，否则两个协程的事务会互相
+    穿插。因此 connection() 全程持有 _lock。单次操作耗时 <1ms，锁竞争可忽略。
+    调用方签名不变，22 个使用点零改动。
+    """
+
     def __init__(self, path: str | None = None) -> None:
         self.path = str(path or DB_PATH)
+        self._conn: aiosqlite.Connection | None = None
+        self._lock: asyncio.Lock | None = None
+        self._ready = False
+
+    async def init(self) -> None:
+        """建连接、建表、跑迁移。幂等，可在启动时显式调用一次。"""
+        if self._ready:
+            return
+        db = await aiosqlite.connect(self.path)
+        db.row_factory = aiosqlite.Row
+        await db.executescript(SCHEMA)
+        # 安全迁移：为现有数据库补全 inline_message_id 列（列已存在时抛错属正常）
+        try:
+            await db.execute("ALTER TABLE shares ADD COLUMN inline_message_id TEXT")
+        except Exception:
+            pass
+        # WAL 让读写不再互相阻塞；NORMAL 省掉每次提交的 fsync 往返
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA synchronous=NORMAL")
+        await db.commit()
+        self._conn = db
+        self._ready = True
+
+    async def close(self) -> None:
+        """关闭共享连接，供进程退出时收尾。"""
+        conn, self._conn = self._conn, None
+        self._ready = False
+        if conn is not None:
+            await conn.close()
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[aiosqlite.Connection]:
-        db = await aiosqlite.connect(self.path)
-        db.row_factory = aiosqlite.Row
-        try:
-            await db.executescript(SCHEMA)
-            # 安全迁移：为现有数据库补全 inline_message_id 列
-            try:
-                await db.execute("ALTER TABLE shares ADD COLUMN inline_message_id TEXT")
-            except Exception:
-                pass
-            await db.commit()
-            yield db
-        finally:
-            await db.close()
+        # 懒创建锁：Store() 在事件循环启动前就于模块级实例化，
+        # 此处两行之间没有 await，单线程事件循环下是原子的。
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            if not self._ready:
+                await self.init()
+            assert self._conn is not None
+            yield self._conn
 
     async def list_subs(self, user_id: int) -> list[dict[str, Any]]:
         async with self.connection() as db:

@@ -15,6 +15,38 @@ PROTO_RE = re.compile(
     re.I,
 )
 
+# ── 共享 HTTP 会话 ────────────────────────────────────────────────────────────
+# 旧实现每抓一条订阅就新建一个 ClientSession，等于每条都重做 TLS 握手、
+# 建连接池然后立刻扔掉。同一机场的多条订阅同域名，keep-alive 完全吃不到。
+# 改成进程级共享：连接复用，握手往返省掉，和批量并发叠加收益最明显。
+_SESSION: aiohttp.ClientSession | None = None
+
+
+async def get_session() -> aiohttp.ClientSession:
+    """取共享会话。惰性创建（ClientSession 必须在事件循环内构造）。
+
+    并发安全：判空到赋值之间没有 await（ClientSession/TCPConnector 构造都是
+    同步的），单线程事件循环下是原子的，不会重复建会话。
+    """
+    global _SESSION
+    if _SESSION is None or _SESSION.closed:
+        connector = aiohttp.TCPConnector(
+            limit=32,             # 总连接上限
+            limit_per_host=8,     # 单域名上限，防止把小机场打崩
+            ttl_dns_cache=300,    # DNS 缓存 5 分钟，省掉重复解析
+            enable_cleanup_closed=True,
+        )
+        _SESSION = aiohttp.ClientSession(connector=connector)
+    return _SESSION
+
+
+async def close_session() -> None:
+    """关闭共享会话，供进程退出时收尾。"""
+    global _SESSION
+    session, _SESSION = _SESSION, None
+    if session is not None and not session.closed:
+        await session.close()
+
 
 def _b64decode(data: str) -> bytes | None:
     s = data.strip().replace("-", "+").replace("_", "/")
@@ -292,14 +324,14 @@ async def fetch_subscription(url: str, timeout: int = 25) -> tuple[list[dict[str
         "Accept": "*/*",
     }
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-                body = await resp.text(errors="ignore")
-                meta = parse_subscription_headers(resp.headers)
-                nodes = parse_nodes_from_text(body)
-                if not nodes and resp.status >= 400:
-                    return [], meta, f"HTTP {resp.status}"
-                return nodes, meta, None
+        session = await get_session()
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            body = await resp.text(errors="ignore")
+            meta = parse_subscription_headers(resp.headers)
+            nodes = parse_nodes_from_text(body)
+            if not nodes and resp.status >= 400:
+                return [], meta, f"HTTP {resp.status}"
+            return nodes, meta, None
     except Exception as e:
         return [], {"traffic_used": None, "traffic_total": None, "expire_at": None, "profile_name": None}, str(e)
 
