@@ -485,7 +485,7 @@ class Store:
             return cur.rowcount
 
     async def create_short(self, user_id: int, target_url: str) -> str:
-        code = secrets.token_urlsafe(6)
+        code = secrets.token_urlsafe(9)
         async with self.connection() as db:
             await db.execute(
                 "INSERT INTO short_links(code,user_id,target_url,created_at) VALUES(?,?,?,?)",

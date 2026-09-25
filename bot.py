@@ -346,27 +346,32 @@ async def refresh_sub(
     meta_only=True 时返回瘦行（不含 nodes_json，节点数在 node_count 键）。
     默认行为会把刚写进去的 nodes_json 再读回来，巨型订阅下等于白搬几十 MB；
     只需要节点数的调用方应该开这个开关，然后读 node_count 而不是 nodes_of()。
+
+    抓取失败或解析出 0 个节点时，只写 last_error，不覆盖已缓存的 nodes_json。
     """
     nodes, meta, err = await fetch_subscription(sub["url"])
     fields: dict[str, Any] = {
-        "nodes_json": json.dumps(nodes, ensure_ascii=False),
-        "node_count": len(nodes),
         "last_error": err,
         "traffic_used": meta.get("traffic_used"),
         "traffic_total": meta.get("traffic_total"),
         "expire_at": meta.get("expire_at"),
     }
-    profile_name = (meta.get("profile_name") or "").strip()
-    if profile_name and (rename or looks_like_host_name(sub.get("name"))):
-        fields["name"] = profile_name
+    if err is None and nodes:
+        fields["nodes_json"] = json.dumps(nodes, ensure_ascii=False)
+        fields["node_count"] = len(nodes)
+        profile_name = (meta.get("profile_name") or "").strip()
+        if profile_name and (rename or looks_like_host_name(sub.get("name"))):
+            fields["name"] = profile_name
+    elif err is None:
+        fields["last_error"] = "订阅中未解析出任何节点"
     updated = await store.update_sub(
         user_id, int(sub["id"]), return_meta=meta_only, **fields
     )
     if updated is None:
-        # 更新失败（行已被删等）时回退原行，但节点数用刚抓到的真实值补上，
-        # 免得调用方读到过期的 node_count。
         fallback = dict(sub)
-        fallback["node_count"] = len(nodes)
+        if "node_count" in fields:
+            fallback["node_count"] = fields["node_count"]
+        fallback["last_error"] = fields["last_error"]
         return fallback
     return updated
 
@@ -717,23 +722,18 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not all_nodes:
         await update.effective_message.reply_text("暂无可导出节点。", reply_markup=MAIN_KB)
         return
-    # create a temporary aggregate token via short link target using first sub style endpoint is complex;
-    # instead create short link to base64 content hosted endpoint
     code = await store.create_short(user_id, "aggregate://all")
-    # store aggregate snapshot in short target by rewriting to special path
-    # simpler: reply files as text snippets / links using per-user aggregate route
-    clash = to_clash(all_nodes)
-    b64 = to_base64_sub(all_nodes)
+    clash_url = f"{PUBLIC_BASE_URL}/agg/{code}/clash"
+    base64_url = f"{PUBLIC_BASE_URL}/agg/{code}/base64"
     await update.effective_message.reply_html(
         f"📦 <b>导出完成</b>\n节点数: {len(all_nodes)}\n\n"
-        f"Clash:\n<code>{html.escape(PUBLIC_BASE_URL + '/agg/' + str(user_id) + '/clash')}</code>\n"
-        f"Base64:\n<code>{html.escape(PUBLIC_BASE_URL + '/agg/' + str(user_id) + '/base64')}</code>\n\n"
+        f"Clash:\n<code>{html.escape(clash_url)}</code>\n"
+        f"Base64:\n<code>{html.escape(base64_url)}</code>\n\n"
         f"短链码: <code>{html.escape(code)}</code>",
         reply_markup=MAIN_KB,
         disable_web_page_preview=True,
     )
-    # keep references unused lint quiet
-    _ = (clash, b64)
+
 
 
 async def cmd_short(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -888,11 +888,16 @@ async def cmd_search_export(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not nodes:
         await update.effective_message.reply_text("匹配订阅暂无可导出节点。", reply_markup=MAIN_KB)
         return
+    code = await store.create_short(
+        update.effective_user.id,
+        "aggregate://ids/" + ",".join(str(int(hit["id"])) for hit in hits),
+    )
     await update.effective_message.reply_text(
-        f"📦 搜索导出完成：{len(hits)} 个订阅，{len(nodes)} 个节点\\n"
-        f"{PUBLIC_BASE_URL}/agg/{update.effective_user.id}/clash",
+        f"📦 搜索导出完成：{len(hits)} 个订阅，{len(nodes)} 个节点\n"
+        f"{PUBLIC_BASE_URL}/agg/{code}/clash",
         reply_markup=MAIN_KB,
     )
+
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1831,14 +1836,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
 
-async def mapped_nodes_for_user(user_id: int) -> list[dict[str, Any]]:
+async def mapped_nodes_for_user(user_id: int, sub_ids: list[int] | None = None) -> list[dict[str, Any]]:
     maps = {m["node_name"]: m["remark"] for m in await store.list_path_maps(user_id)}
+    if sub_ids is None:
+        subs = await store.list_subs(user_id)
+    else:
+        subs = []
+        for sub_id in sub_ids:
+            sub = await store.get_sub(user_id, sub_id)
+            if sub is not None:
+                subs.append(sub)
     nodes: list[dict[str, Any]] = []
-    for sub in await store.list_subs(user_id):
+    for sub in subs:
         nodes.extend(apply_path_maps(nodes_of(sub), maps))
-    for t in await store.list_temp(user_id):
-        nodes.append({"name": t["name"], "type": "temp", "share": t["url"]})
+    if sub_ids is None:
+        for t in await store.list_temp(user_id):
+            nodes.append({"name": t["name"], "type": "temp", "share": t["url"]})
     return nodes
+
 
 
 async def http_sub(request: web.Request) -> web.Response:
@@ -1849,9 +1864,6 @@ async def http_sub(request: web.Request) -> web.Response:
         return web.Response(status=404, text="not found")
     maps = {m["node_name"]: m["remark"] for m in await store.list_path_maps(int(sub["user_id"]))}
     nodes = apply_path_maps(nodes_of(sub), maps)
-    if not nodes:
-        sub = await refresh_sub(int(sub["user_id"]), sub)
-        nodes = apply_path_maps(nodes_of(sub), maps)
     if kind in ("base64", "v2ray", "mixed"):
         return web.Response(text=to_base64_sub(nodes), content_type="text/plain")
     if kind in ("singbox", "sing-box"):
@@ -1864,11 +1876,26 @@ async def http_sub(request: web.Request) -> web.Response:
 
 
 async def http_agg(request: web.Request) -> web.Response:
-    user_id = int(request.match_info["user_id"])
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        return web.Response(status=403, text="forbidden")
+    code = request.match_info["code"]
+    row = await store.get_short(code)
+    if not row:
+        return web.Response(status=404, text="not found")
+    target = str(row["target_url"])
+    user_id = int(row["user_id"])
+    if target == "aggregate://all":
+        nodes = await mapped_nodes_for_user(user_id)
+    elif target.startswith("aggregate://ids/"):
+        raw_ids = target.removeprefix("aggregate://ids/")
+        try:
+            sub_ids = [int(value) for value in raw_ids.split(",") if value]
+        except ValueError:
+            return web.Response(status=400, text="invalid aggregate target")
+        if not sub_ids:
+            return web.Response(status=404, text="not found")
+        nodes = await mapped_nodes_for_user(user_id, sub_ids)
+    else:
+        return web.Response(status=404, text="not found")
     kind = request.match_info.get("kind", "clash").lower()
-    nodes = await mapped_nodes_for_user(user_id)
     if kind in ("base64", "v2ray", "mixed"):
         return web.Response(text=to_base64_sub(nodes), content_type="text/plain")
     if kind in ("singbox", "sing-box"):
@@ -1880,17 +1907,20 @@ async def http_agg(request: web.Request) -> web.Response:
     return web.Response(text=to_clash(nodes), content_type="text/yaml")
 
 
+
+
 async def http_short(request: web.Request) -> web.Response:
     code = request.match_info["code"]
     row = await store.get_short(code)
     if not row:
         return web.Response(status=404, text="not found")
     target = row["target_url"]
-    if target.startswith("aggregate://"):
-        raise web.HTTPFound(f"/agg/{row['user_id']}/clash")
+    if target == "aggregate://all" or target.startswith("aggregate://ids/"):
+        raise web.HTTPFound(f"/agg/{code}/clash")
     if not target.startswith(("http://", "https://")):
         return web.Response(status=400, text="invalid target")
     raise web.HTTPFound(target)
+
 
 
 async def http_health(_: web.Request) -> web.Response:
@@ -1902,7 +1932,7 @@ async def start_http(app: Application) -> web.AppRunner:
     api.router.add_get("/health", http_health)
     api.router.add_get("/sub/{token}/{kind}", http_sub)
     api.router.add_get("/sub/{token}", http_sub)
-    api.router.add_get("/agg/{user_id}/{kind}", http_agg)
+    api.router.add_get("/agg/{code}/{kind}", http_agg)
     api.router.add_get("/s/{code}", http_short)
     runner = web.AppRunner(api)
     await runner.setup()

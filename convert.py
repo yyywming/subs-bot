@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import ipaddress
 import json
 import re
+import socket
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
+
+MAX_SUBSCRIPTION_REDIRECTS = 5
+MAX_SUBSCRIPTION_BYTES = 10 * 1024 * 1024
+
 
 import aiohttp
 import yaml
@@ -318,6 +325,30 @@ def parse_subscription_headers(headers: aiohttp.typedefs.LooseHeaders | dict[str
     return info
 
 
+async def _check_public_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("订阅 URL 仅支持 http/https")
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("订阅 URL 缺少主机名")
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"订阅主机名解析失败: {exc}") from exc
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError(f"订阅地址指向内网/保留地址: {host} -> {ip}")
+
+
 async def fetch_subscription(url: str, timeout: int = 25) -> tuple[list[dict[str, Any]], dict[str, Any], str | None]:
     headers = {
         "User-Agent": "clash-meta/1.18.0",
@@ -325,13 +356,33 @@ async def fetch_subscription(url: str, timeout: int = 25) -> tuple[list[dict[str
     }
     try:
         session = await get_session()
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-            body = await resp.text(errors="ignore")
-            meta = parse_subscription_headers(resp.headers)
-            nodes = parse_nodes_from_text(body)
-            if not nodes and resp.status >= 400:
-                return [], meta, f"HTTP {resp.status}"
-            return nodes, meta, None
+        current = url
+        for redirect_count in range(MAX_SUBSCRIPTION_REDIRECTS + 1):
+            await _check_public_url(current)
+            async with session.get(
+                current,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                allow_redirects=False,
+            ) as resp:
+                meta = parse_subscription_headers(resp.headers)
+                if 300 <= resp.status < 400:
+                    location = resp.headers.get("Location")
+                    if not location:
+                        return [], meta, "订阅重定向缺少 Location"
+                    if redirect_count >= MAX_SUBSCRIPTION_REDIRECTS:
+                        return [], meta, "订阅重定向次数过多"
+                    current = urljoin(current, location)
+                    continue
+                if resp.status >= 400:
+                    return [], meta, f"HTTP {resp.status}"
+                body = await resp.content.read(MAX_SUBSCRIPTION_BYTES + 1)
+                if len(body) > MAX_SUBSCRIPTION_BYTES:
+                    return [], meta, "订阅响应过大"
+                text = body.decode(resp.charset or "utf-8", errors="ignore")
+                nodes = parse_nodes_from_text(text)
+                return nodes, meta, None
+        return [], {"traffic_used": None, "traffic_total": None, "expire_at": None, "profile_name": None}, "订阅重定向次数过多"
     except Exception as e:
         return [], {"traffic_used": None, "traffic_total": None, "expire_at": None, "profile_name": None}, str(e)
 

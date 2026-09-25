@@ -7,12 +7,20 @@ from pathlib import Path
 def _load_dotenv(path: Path) -> None:
     if not path.exists():
         return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
+        key = key.strip()
+        value = value.strip()
+        if " #" in value:
+            value = value.split(" #", 1)[0].rstrip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
 
 
 def _env_int(name: str, default: int, minimum: int = 0, maximum: int | None = None) -> int:
@@ -28,7 +36,9 @@ def _env_int(name: str, default: int, minimum: int = 0, maximum: int | None = No
 ROOT = Path(__file__).resolve().parent
 _load_dotenv(ROOT / ".env")
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise SystemExit("缺少 BOT_TOKEN：请在 .env 填写 BotFather 下发的 token")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "your_bot_username").lstrip("@")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 ALLOWED_USER_IDS = {
@@ -38,7 +48,7 @@ ALLOWED_USER_IDS = {
 }
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8787").rstrip("/")
 HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
-HTTP_PORT = int(os.environ.get("HTTP_PORT", "8787"))
+HTTP_PORT = _env_int("HTTP_PORT", 8787, 1, 65535)
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(ROOT / "data")))
 DB_PATH = Path(os.environ.get("DB_PATH", str(DATA_DIR / "subs.db")))
 MAX_DOCUMENT_BYTES = _env_int("MAX_DOCUMENT_BYTES", 10 * 1024 * 1024, 1, 50 * 1024 * 1024)

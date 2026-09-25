@@ -27,6 +27,16 @@ Telegram 订阅管理机器人，复刻自 @MxlDYBot。
 | 短链服务 | `/s/{code}` 重定向 |
 | 临时节点 | 发送 ss:// 等分享链接加入临时列表 |
 
+## 部署位置
+
+生产环境在小米 10 的 Droidspaces 容器 `server` 里：
+
+- 代码目录：`/opt/subs-bot`
+- 数据目录：`/opt/subs-bot/data`
+- systemd：`subs-bot.service`
+- 健康检查：`http://127.0.0.1:8787/health`
+- Magisk 看门狗：`99-mi10-server.sh` 连续 3 次 health 失败后 `systemctl restart subs-bot`
+
 ## 迁移到新 VPS
 
 ```bash
@@ -36,7 +46,7 @@ cd /opt/subs-bot
 
 # 2. 配置
 cp .env.example .env
-nano .env   # 填 BOT_TOKEN, BOT_USERNAME, ALLOWED_USER_IDS, PUBLIC_BASE_URL
+nano .env   # 必填 BOT_TOKEN, ALLOWED_USER_IDS, PUBLIC_BASE_URL
 # 可选：GITHUB_TOKEN（提高 /g 搜索 API 限额）
 
 # 3. 一键部署（venv + systemd）

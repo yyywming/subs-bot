@@ -34,36 +34,59 @@ python3 -m venv "${VENV_DIR}"
 if [ ! -f "${INSTALL_DIR}/.env" ]; then
     echo ">>> copying .env.example -> .env"
     cp .env.example .env
+    chmod 600 .env
     echo "  !! Edit .env: set BOT_TOKEN, ALLOWED_USER_IDS, PUBLIC_BASE_URL"
     echo "  !! Then re-run: ./deploy.sh"
     exit 0
 fi
 
+chmod 600 "${INSTALL_DIR}/.env" || true
+
+_env_get() {
+    # shellcheck disable=SC1091
+    (
+        set -a
+        # shellcheck disable=SC1090
+        . "${INSTALL_DIR}/.env"
+        set +a
+        eval "printf '%s' \"\${$1-}\""
+    )
+}
+
+BOT_TOKEN_VALUE="$(_env_get BOT_TOKEN)"
+if [ -z "${BOT_TOKEN_VALUE}" ]; then
+    echo "ERROR: BOT_TOKEN is empty in ${INSTALL_DIR}/.env"
+    exit 1
+fi
+
 echo ">>> installing systemd service..."
-cat > /etc/systemd/system/subs-bot.service <<UNIT
-[Unit]
-Description=Telegram Subs Bot
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=${INSTALL_DIR}
-EnvironmentFile=${INSTALL_DIR}/.env
-ExecStart=${VENV_DIR}/bin/python ${INSTALL_DIR}/bot.py
-Restart=always
-RestartSec=3
-User=root
-
-[Install]
-WantedBy=multi-user.target
-UNIT
+install -m 644 "${INSTALL_DIR}/subs-bot.service" /etc/systemd/system/subs-bot.service
+sed -i \
+    -e "s#WorkingDirectory=.*#WorkingDirectory=${INSTALL_DIR}#" \
+    -e "s#EnvironmentFile=.*#EnvironmentFile=${INSTALL_DIR}/.env#" \
+    -e "s#ExecStart=.*#ExecStart=${VENV_DIR}/bin/python ${INSTALL_DIR}/bot.py#" \
+    /etc/systemd/system/subs-bot.service
 
 systemctl daemon-reload
 systemctl enable subs-bot
 systemctl restart subs-bot
 
-sleep 2
+echo ">>> waiting for health..."
+ok=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -sf -m 3 "http://127.0.0.1:8787/health" >/dev/null; then
+        ok=1
+        break
+    fi
+    sleep 1
+done
+if [ "$ok" -ne 1 ]; then
+    echo "ERROR: health check failed"
+    systemctl --no-pager --full status subs-bot || true
+    journalctl -u subs-bot -n 40 --no-pager || true
+    exit 1
+fi
+
 echo ">>> status:"
 systemctl is-active subs-bot
 echo "=== done ==="
