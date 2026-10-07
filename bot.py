@@ -188,7 +188,7 @@ def list_button_label(idx: int, sub: dict[str, Any]) -> str:
     exp = sub.get("expire_at")
     now = int(time.time())
     if exp is None or exp <= 0:
-        days = "未知"
+        days = "长期"
         is_expired = False
         is_soon = False
     else:
