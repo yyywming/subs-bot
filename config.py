@@ -33,6 +33,40 @@ def _env_int(name: str, default: int, minimum: int = 0, maximum: int | None = No
     return min(value, maximum) if maximum is not None else value
 
 
+TG_USER_ID_MAX = 2**63 - 1
+
+
+def parse_tg_user_id(raw: str) -> int | None:
+    """正整数 Telegram 用户 ID：1..2**63-1 的 ASCII 数字，无符号、无前导 0。
+
+    超出 SQLite 有符号 int64 的值返回 None，避免写入时 OverflowError。
+    """
+    text = raw.strip()
+    if not text or not text.isascii() or not text.isdigit() or text[0] == "0":
+        return None
+    value = int(text)
+    if value > TG_USER_ID_MAX:
+        return None
+    return value
+
+
+def parse_user_id_set(raw: str) -> set[int]:
+    found: set[int] = set()
+    for part in raw.split(","):
+        parsed = parse_tg_user_id(part)
+        if parsed is not None:
+            found.add(parsed)
+    return found
+
+
+def resolve_admin_ids(allowed_ids: set[int], admin_raw: str | None) -> set[int]:
+    """未设置 ADMIN_USER_IDS 时管理员等于白名单；显式设置（含空字符串）按原文解析。"""
+    if admin_raw is None:
+        return set(allowed_ids)
+    return parse_user_id_set(admin_raw)
+
+
+
 ROOT = Path(__file__).resolve().parent
 _load_dotenv(ROOT / ".env")
 
@@ -41,11 +75,9 @@ if not BOT_TOKEN:
     raise SystemExit("缺少 BOT_TOKEN：请在 .env 填写 BotFather 下发的 token")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "your_bot_username").lstrip("@")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-ALLOWED_USER_IDS = {
-    int(x.strip())
-    for x in os.environ.get("ALLOWED_USER_IDS", "").split(",")
-    if x.strip().isdigit()
-}
+ALLOWED_USER_IDS = parse_user_id_set(os.environ.get("ALLOWED_USER_IDS", ""))
+# 不把第一个使用者提升为管理员。管理员集合为空时，Bot 内授权管理关闭。
+ADMIN_USER_IDS = resolve_admin_ids(ALLOWED_USER_IDS, os.environ.get("ADMIN_USER_IDS"))
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8787").rstrip("/")
 HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
 HTTP_PORT = _env_int("HTTP_PORT", 8787, 1, 65535)

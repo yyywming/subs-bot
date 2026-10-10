@@ -10,7 +10,7 @@ from typing import Any, AsyncIterator
 
 import aiosqlite
 
-from config import DB_PATH
+from config import DB_PATH, TG_USER_ID_MAX
 
 log = logging.getLogger("subs-bot.db")
 
@@ -107,6 +107,14 @@ CREATE TABLE IF NOT EXISTS share_claims (
     claimed_at INTEGER NOT NULL,
     UNIQUE(share_code, user_id)
 );
+-- 只记录覆盖项（1 允许 / 0 拒绝）。启动时不要把 ALLOWED_USER_IDS 灌进这张表，
+-- 否则环境白名单里被撤销的非管理员会在重启后被重新加回。
+CREATE TABLE IF NOT EXISTS auth_overrides (
+    user_id INTEGER PRIMARY KEY,
+    allowed INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 """
 
 
@@ -117,6 +125,15 @@ def _count_nodes_json(raw: str | None) -> int:
     except Exception:
         return 0
     return len(data) if isinstance(data, list) else 0
+
+
+def _require_tg_user_id(user_id: int) -> int:
+    """拒绝无法放进 SQLite INTEGER（有符号 int64）的 id。"""
+    if isinstance(user_id, bool) or not isinstance(user_id, int):
+        raise ValueError("user_id must be an int")
+    if user_id <= 0 or user_id > TG_USER_ID_MAX:
+        raise ValueError("user_id out of Telegram int64 range")
+    return user_id
 
 
 class Store:
@@ -580,6 +597,47 @@ class Store:
             cur = await db.execute("SELECT * FROM shares WHERE code=?", (code,))
             share = dict(await cur.fetchone())
             return True, "领取成功", share
+
+    async def get_auth_override(self, user_id: int) -> bool | None:
+        """显式允许为 True，显式拒绝为 False，没有覆盖项为 None。"""
+        user_id = _require_tg_user_id(user_id)
+        async with self.connection() as db:
+            cur = await db.execute(
+                "SELECT allowed FROM auth_overrides WHERE user_id=?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            return int(row["allowed"]) != 0
+
+    async def set_auth_override(self, user_id: int, allowed: bool) -> None:
+        """写入或覆盖一条授权。不解释管理员策略，调用方自行拒绝撤销管理员。"""
+        user_id = _require_tg_user_id(user_id)
+        if not isinstance(allowed, bool):
+            raise ValueError("allowed must be a bool")
+        now = int(time.time())
+        flag = 1 if allowed else 0
+        async with self.connection() as db:
+            await db.execute(
+                """INSERT INTO auth_overrides(user_id, allowed, created_at, updated_at)
+                   VALUES(?, ?, ?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                     allowed=excluded.allowed,
+                     updated_at=excluded.updated_at""",
+                (user_id, flag, now, now),
+            )
+            await db.commit()
+
+    async def list_auth_overrides(self) -> list[tuple[int, bool]]:
+        async with self.connection() as db:
+            cur = await db.execute(
+                "SELECT user_id, allowed FROM auth_overrides ORDER BY user_id ASC"
+            )
+            return [
+                (int(row["user_id"]), int(row["allowed"]) != 0)
+                for row in await cur.fetchall()
+            ]
 
 
 def nodes_of(sub: dict[str, Any]) -> list[dict[str, Any]]:

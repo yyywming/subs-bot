@@ -36,8 +36,8 @@ from telegram.ext import (
     filters,
 )
 
+import config
 from config import (
-    ALLOWED_USER_IDS,
     BOT_TOKEN,
     BOT_USERNAME,
     GITHUB_TOKEN,
@@ -48,6 +48,7 @@ from config import (
     MAX_IMPORTED_SUBSCRIPTIONS,
     PUBLIC_BASE_URL,
     UPDATE_CONCURRENCY,
+    parse_tg_user_id,
 )
 from convert import (
     apply_path_maps,
@@ -143,17 +144,54 @@ HELP_TEXT = (
     "格式：路径关键词 空格 配置名称\n"
     "例如：liangxinyun 良心云\n"
     "/path clear - 清空全部\n\n"
-    "发送数字编号可查看订阅详情。"
+    "<b>群组协作</b>\n"
+    "群内授权成员共用本群订阅；私聊与不同群之间独立。\n"
+    "无关群消息不回复。可用 /list、列表按钮、独立链接，或 @机器人用户名 输入。\n"
+    "群内编号详情请点击按钮，或提及/回复 Bot 后发送编号。\n\n"
+    "<b>授权管理（仅管理员私聊）</b>\n"
+    "/auth list - 查看授权\n"
+    "/auth add 用户ID - 添加授权\n"
+    "/auth remove 用户ID - 撤销授权\n"
+    "授权变更立即生效并持久化；授权用户不能再授权他人。\n\n"
+    "私聊发送数字编号可查看订阅详情。"
 )
 
 
-def allowed(user_id: int | None) -> bool:
-    return bool(user_id) and (not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS)
+async def allowed(user_id: int | None) -> bool:
+    """当前用户是否可用 Bot。每次都读配置和数据库覆盖项，授权立刻生效。
 
-
-async def deny(update: Update) -> bool:
-    if update.effective_user and allowed(update.effective_user.id):
+    管理员始终允许。显式拒绝优先于环境白名单，也优先于公开模式。
+    ALLOWED_USER_IDS 为空是公开模式（显式拒绝仍然生效）。没有第一用户自动升权。
+    """
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
         return False
+    if user_id in config.ADMIN_USER_IDS:
+        return True
+    try:
+        override = await store.get_auth_override(user_id)
+    except ValueError:
+        return False
+    if override is False:
+        return False
+    if override is True:
+        return True
+    allowed_ids = config.ALLOWED_USER_IDS
+    if not allowed_ids:
+        return True
+    return user_id in allowed_ids
+
+
+async def deny(update: Update, quiet: bool = False) -> bool:
+    """未授权返回 True。quiet=True 时不回复，供群里的普通消息使用。
+
+    命令和回调保持默认 quiet=False，继续明确拒绝。判断的是 effective_user，
+    不是群共享订阅的 scope id。
+    """
+    user = update.effective_user
+    if user is not None and await allowed(user.id):
+        return False
+    if quiet:
+        return True
     text = "此 Bot 需要授权使用\n授权请联系管理员"
     if update.callback_query:
         await update.callback_query.answer(text, show_alert=True)
@@ -162,8 +200,158 @@ async def deny(update: Update) -> bool:
     return True
 
 
+_AUTH_USAGE = (
+    "用法：\n"
+    "/auth list — 查看授权\n"
+    "/auth add <用户ID> — 授权，或回复对方消息后发送 /auth add\n"
+    "/auth remove <用户ID> — 取消授权，或回复对方消息后发送 /auth remove\n"
+    "用户 ID 为 1 到 9223372036854775807 的 ASCII 正整数，不能有前导 0。\n"
+    "动态授权可以使用 Bot，但不能再授权他人。管理员来自环境变量，不能在这里撤销。"
+)
+
+_AUTH_DISABLED = (
+    "授权管理未启用：当前没有配置管理员，也不会把第一个使用者自动升为管理员。\n"
+    "请在服务器 .env 设置 ADMIN_USER_IDS 后重启。"
+    "未设置该变量时，管理员等于 ALLOWED_USER_IDS。"
+)
+
+
+def _format_auth_list(overrides: list[tuple[int, bool]]) -> str:
+    allowed_ids = set(config.ALLOWED_USER_IDS)
+    admin_ids = set(config.ADMIN_USER_IDS)
+    denied = {uid for uid, ok in overrides if not ok}
+    granted = [uid for uid, ok in overrides if ok]
+    if allowed_ids:
+        lines = ["授权模式：白名单"]
+    else:
+        lines = ["授权模式：公开（未配置 ALLOWED_USER_IDS，除显式拒绝外都可使用）"]
+    if admin_ids:
+        lines.append("管理员（环境变量，不能在 Bot 内撤销）：")
+        lines.extend(f"• {uid}" for uid in sorted(admin_ids))
+    else:
+        lines.append("管理员：未配置")
+    env_users = sorted(allowed_ids - admin_ids)
+    if env_users:
+        lines.append("环境白名单（非管理员）：")
+        for uid in env_users:
+            suffix = "（已撤销）" if uid in denied else ""
+            lines.append(f"• {uid}{suffix}")
+    if granted:
+        lines.append("动态授权：")
+        lines.extend(f"• {uid}" for uid in sorted(granted))
+    if denied:
+        lines.append("显式拒绝：")
+        lines.extend(f"• {uid}" for uid in sorted(denied))
+    if not allowed_ids and not granted and not denied:
+        lines.append("当前没有动态授权或显式拒绝。")
+    lines.append("动态授权可以使用 Bot，但不能添加或删除授权。")
+    return "\n".join(lines)
+
+
+def _auth_target(update: Update, args: list[str]) -> tuple[int | None, str | None]:
+    if args:
+        if len(args) != 1:
+            return None, _AUTH_USAGE
+        parsed = parse_tg_user_id(args[0])
+        if parsed is None:
+            return None, (
+                "用户 ID 必须是 1 到 9223372036854775807 之间的 ASCII 正整数，不能有前导 0。"
+            )
+        return parsed, None
+    message = update.effective_message
+    reply = getattr(message, "reply_to_message", None) if message is not None else None
+    replied_user = getattr(reply, "from_user", None) if reply is not None else None
+    target_id = getattr(replied_user, "id", None) if replied_user is not None else None
+    if isinstance(target_id, bool) or not isinstance(target_id, int):
+        return None, "请提供用户 ID，或回复要操作的那条用户消息。\n" + _AUTH_USAGE
+    parsed = parse_tg_user_id(str(target_id))
+    if parsed is None:
+        return None, "回复的用户 ID 不在 Telegram 允许的范围内。"
+    return parsed, None
+
+
+async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """私聊中的授权管理。群里不改名单，也不展示名单。"""
+    if await deny(update):
+        return
+    message = update.effective_message
+    if message is None:
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        await message.reply_text("授权管理只能在私聊中使用，以免暴露授权名单。")
+        return
+    actor = update.effective_user
+    if actor is None:
+        return
+    admin_ids = config.ADMIN_USER_IDS
+    if not admin_ids:
+        await message.reply_text(_AUTH_DISABLED)
+        return
+    if actor.id not in admin_ids:
+        await message.reply_text("只有管理员可以管理授权。")
+        return
+    args = [str(part) for part in (getattr(context, "args", None) or [])]
+    action = args[0].lower() if args else "list"
+    rest = args[1:] if args else []
+    if action in {"list", "ls"}:
+        if rest:
+            await message.reply_text(_AUTH_USAGE)
+            return
+        await message.reply_text(_format_auth_list(await store.list_auth_overrides()))
+        return
+    if action not in {"add", "remove", "del", "rm"}:
+        await message.reply_text(_AUTH_USAGE)
+        return
+    target, error = _auth_target(update, rest)
+    if error or target is None:
+        await message.reply_text(error or _AUTH_USAGE)
+        return
+    if action == "add":
+        if target in admin_ids:
+            await message.reply_text("该用户已是管理员，无需再授权。")
+            return
+        await store.set_auth_override(target, True)
+        await message.reply_text(f"已授权 {target}。该用户可以使用 Bot，但不能管理授权。")
+        return
+    if target in admin_ids:
+        await message.reply_text(
+            "不能通过 Bot 撤销管理员。请修改服务器上的 ADMIN_USER_IDS"
+            "（未单独配置时等同 ALLOWED_USER_IDS）后重启。"
+        )
+        return
+    await store.set_auth_override(target, False)
+    await message.reply_text(f"已取消 {target} 的授权。重启后仍然有效，不会被环境白名单重新加回。")
+
+
 def sub_token_url(token: str, kind: str = "clash") -> str:
     return f"{PUBLIC_BASE_URL}/sub/{token}/{kind}"
+
+
+def scope_owner(update: Update) -> int:
+    """群/超群订阅归群 chat id；私聊及其它会话仍用用户 id。"""
+    chat = update.effective_chat
+    if chat.type in {"group", "supergroup"}:
+        return chat.id
+    return update.effective_user.id
+
+
+def interaction_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict[str, Any]:
+    """重命名/翻页/路径/API 等待按用户+会话隔离。sort_mode 留在 user_data，供个人内联查询。"""
+    data = context.user_data
+    if data is None:
+        data = {}
+        context.user_data = data
+    chat_id = update.effective_chat.id
+    scopes = data.get("interaction")
+    if not isinstance(scopes, dict):
+        scopes = {}
+        data["interaction"] = scopes
+    bucket = scopes.get(chat_id)
+    if not isinstance(bucket, dict):
+        bucket = {}
+        scopes[chat_id] = bucket
+    return bucket
 
 
 def progress_bar(used: float | None, total: float | None) -> str:
@@ -498,14 +686,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
-    text, kb = await render_list(update.effective_user.id, 0)
+    text, kb = await render_list(scope_owner(update), 0)
     await update.effective_message.reply_html(text, reply_markup=kb, disable_web_page_preview=True)
 
 
 async def cmd_expire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
-    subs = await store.list_subs_meta(update.effective_user.id)
+    subs = await store.list_subs_meta(scope_owner(update))
     now = int(time.time())
     soon = []
     for i, sub in enumerate(subs, start=1):
@@ -532,7 +720,7 @@ async def cmd_expire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_update_all_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
-    user_id = update.effective_user.id
+    user_id = scope_owner(update)
     n = await store.count_subs(user_id)
     if not n:
         await update.effective_message.reply_text("暂无订阅可更新。", reply_markup=MAIN_KB)
@@ -556,10 +744,11 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     有 3 条死链就得干等 75s+，而这期间界面上一个字都不动，用户只会以为 bot 死了。
     现在用 Semaphore(UPDATE_CONCURRENCY) 限流并发，墙钟时间从"累加"变成"最慢那条"。
     """
-    user_id = update.effective_user.id
+    user_id = scope_owner(update)
+    deliver_to = update.effective_chat.id
     subs = await store.list_subs_meta(user_id)
     if not subs:
-        await context.bot.send_message(chat_id=user_id, text="暂无订阅可更新。", reply_markup=MAIN_KB)
+        await context.bot.send_message(chat_id=deliver_to, text="暂无订阅可更新。", reply_markup=MAIN_KB)
         return
 
     total = len(subs)
@@ -648,7 +837,7 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ]
     for name, content in files:
         doc = InputFile(content.encode("utf-8"), filename=name)
-        await context.bot.send_document(chat_id=user_id, document=doc)
+        await context.bot.send_document(chat_id=deliver_to, document=doc)
     stats = f"有效:{len(valid)} | 耗尽:{len(drained)} | 过期:{len(expired)} | 失败:{len(failed)}"
     if failed:
         keyboard = InlineKeyboardMarkup([
@@ -662,20 +851,20 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ],
         ])
         await context.bot.send_message(
-            chat_id=user_id,
+            chat_id=deliver_to,
             text=f"{stats}\n\n检测到 {len(failed)} 条失效订阅，是否从订阅列表中删除？",
             reply_markup=keyboard,
         )
     else:
-        await context.bot.send_message(chat_id=user_id, text=stats, reply_markup=MAIN_KB)
+        await context.bot.send_message(chat_id=deliver_to, text=stats, reply_markup=MAIN_KB)
         text_list, kb_list = await render_list(user_id, 0)
-        await context.bot.send_message(chat_id=user_id, text=text_list, reply_markup=kb_list, parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat_id=deliver_to, text=text_list, reply_markup=kb_list, parse_mode=ParseMode.HTML)
 
 
 async def cmd_recycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
-    rows = await store.list_deleted(update.effective_user.id, days=30)
+    rows = await store.list_deleted(scope_owner(update), days=30)
     nav = [[
         InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
         InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
@@ -706,7 +895,7 @@ async def cmd_recycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
-    user_id = update.effective_user.id
+    user_id = scope_owner(update)
     subs = await store.list_subs(user_id)
     maps = {m["node_name"]: m["remark"] for m in await store.list_path_maps(user_id)}
     all_nodes: list[dict[str, Any]] = []
@@ -794,7 +983,7 @@ async def cmd_path(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
     args = context.args or []
-    user_id = update.effective_user.id
+    user_id = scope_owner(update)
     if args and args[0].lower() == "clear":
         n = await store.clear_path_maps(user_id)
         text, kb = await render_path_page(user_id)
@@ -813,7 +1002,7 @@ async def cmd_path(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_renumber(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
-    n = await store.renumber(update.effective_user.id)
+    n = await store.renumber(scope_owner(update))
     await update.effective_message.reply_text(f"已重置编号，当前 {n} 条订阅。", reply_markup=MAIN_KB)
 
 
@@ -824,13 +1013,13 @@ async def cmd_delete_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not q:
         await update.effective_message.reply_text("用法：/d 关键词或订阅链接", reply_markup=MAIN_KB)
         return
-    subs = await store.list_subs_meta(update.effective_user.id)
+    subs = await store.list_subs_meta(scope_owner(update))
     hits = [s for s in subs if q in f"{s['name']} {s['url']}".lower()]
     if not hits:
         await update.effective_message.reply_text("没有匹配订阅。", reply_markup=MAIN_KB)
         return
     for sub in hits:
-        await store.delete_sub(update.effective_user.id, int(sub["id"]))
+        await store.delete_sub(scope_owner(update), int(sub["id"]))
     await update.effective_message.reply_text(f"✅ 已删除 {len(hits)} 个匹配订阅。", reply_markup=MAIN_KB)
 
 
@@ -849,8 +1038,7 @@ async def cmd_inline_sort(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data["sort_mode"] = args
         await update.effective_message.reply_text(f"✅ 内联排序已切换为：{args}", reply_markup=MAIN_KB)
         return
-    if context.user_data is not None:
-        context.user_data["await"] = "inline_sort"
+    interaction_data(update, context)["await"] = "inline_sort"
     current = (context.user_data or {}).get("sort_mode", "默认")
     await update.effective_message.reply_text(
         f"当前排序：{current}\n请发送新的排序方式（默认 / 流量 / 到期 / 名称）。",
@@ -861,8 +1049,7 @@ async def cmd_inline_sort(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def cmd_api_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
-    if context.user_data is not None:
-        context.user_data["await"] = "api_test"
+    interaction_data(update, context)["await"] = "api_test"
     await update.effective_message.reply_text(
         "🧪 API 批量测试\n请发送要测试的 API 地址和 Key，每行一组：\n地址|Key",
         reply_markup=MAIN_KB,
@@ -875,21 +1062,21 @@ async def cmd_search_export(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     q = " ".join(context.args or []).strip().lower()
     # 先用瘦行筛选，再只回取命中的完整节点数据。否则搜一个普通订阅也会先把
     # 其它巨型订阅的几十 MB nodes_json 全搬进内存。
-    subs = await store.list_subs_meta(update.effective_user.id)
+    subs = await store.list_subs_meta(scope_owner(update))
     hits = [s for s in subs if not q or q in f"{s['name']} {s['url']}".lower()]
     if not hits:
         await update.effective_message.reply_text("没有匹配订阅。", reply_markup=MAIN_KB)
         return
     nodes = []
     for hit in hits:
-        sub = await store.get_sub(update.effective_user.id, int(hit["id"]))
+        sub = await store.get_sub(scope_owner(update), int(hit["id"]))
         if sub is not None:
             nodes.extend(nodes_of(sub))
     if not nodes:
         await update.effective_message.reply_text("匹配订阅暂无可导出节点。", reply_markup=MAIN_KB)
         return
     code = await store.create_short(
-        update.effective_user.id,
+        scope_owner(update),
         "aggregate://ids/" + ",".join(str(int(hit["id"])) for hit in hits),
     )
     await update.effective_message.reply_text(
@@ -907,7 +1094,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not q:
         await update.effective_message.reply_text("用法：/s 关键词", reply_markup=MAIN_KB)
         return
-    subs = await store.list_subs_meta(update.effective_user.id)
+    subs = await store.list_subs_meta(scope_owner(update))
     hits = []
     for i, sub in enumerate(subs, start=1):
         blob = f"{sub['name']} {sub['url']}".lower()
@@ -1047,7 +1234,7 @@ async def cmd_temp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
     args = context.args or []
-    user_id = update.effective_user.id
+    user_id = scope_owner(update)
     if args and args[0].lower() == "clear":
         n = await store.clear_temp(user_id)
         await update.effective_message.reply_text(f"已清空临时节点 {n} 条。", reply_markup=MAIN_KB)
@@ -1082,16 +1269,31 @@ async def show_detail(update: Update, user_id: int, idx: int, page: int = 0) -> 
     )
 
 
+def group_input(text: str) -> bool:
+    """Recognize deliberate imports, not links or assignments embedded in chat."""
+    if re.fullmatch(r"[^\n|]+\|\s*https?://\S+", text):
+        return True
+    if text.startswith("短链 ") or text.lower().startswith("short "):
+        return True
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return bool(lines) and all(
+        not re.search(r"\s", line)
+        and (re.fullmatch(r"https?://\S+", line) or extract_share_links(line))
+        for line in lines
+    )
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await deny(update):
+    if update.effective_user is None:
         return
     text = (update.effective_message.text or "").strip()
-    user_id = update.effective_user.id
+    user_id = scope_owner(update)
     if not text:
         return
 
     # ── 交互状态机 ─────────────────────────────────
-    state = context.user_data.get("await") if context.user_data else None
+    scoped = interaction_data(update, context)
+    state = scoped.get("await")
     # ReplyKeyboard 菜单按钮优先级最高：点击菜单时取消正在等待的输入。
     menu_texts = {
         "📦 订阅列表", "📋 订阅列表", "订阅列表", "⏳ 临期列表", "🟠 临期列表",
@@ -1099,21 +1301,36 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "🔄 更新所有", "更新所有", "🔢 重置编号", "重置编号", "♻️ 撤销删除", "撤销删除",
         "🧭 路径对应", "路径对应", "❓ 帮助菜单", "帮助菜单", "帮助",
     }
+    is_group = update.effective_chat.type in {"group", "supergroup"}
+    addressed = False
+    if is_group:
+        username = get_bot_username(context.bot)
+        mention = re.match(rf"^@{re.escape(username)}(?:\s+|$)", text, re.I)
+        if mention:
+            text = text[mention.end():].strip()
+            addressed = True
+        reply = update.effective_message.reply_to_message
+        if reply and reply.from_user and reply.from_user.id == context.bot.id:
+            addressed = True
+        if not state and not addressed and text not in menu_texts and not group_input(text):
+            return
+    if await deny(update):
+        return
     if state and text in menu_texts and context.user_data is not None:
-        context.user_data.pop("await", None)
+        scoped.pop("await", None)
         state = None
 
     if text.lower() in ("取消", "/cancel", "cancel", "退出"):
         if state and context.user_data is not None:
-            context.user_data.pop("await", None)
+            scoped.pop("await", None)
             await update.effective_message.reply_text("已取消当前操作。", reply_markup=MAIN_KB)
             return
 
     # ── 订阅重命名状态机 ─────────────────────────
     if state == "sub_rename":
-        sub_id = (context.user_data or {}).pop("rename_sub_id", None)
-        page = (context.user_data or {}).pop("rename_page", 0)
-        context.user_data.pop("await", None)
+        sub_id = scoped.pop("rename_sub_id", None)
+        page = scoped.pop("rename_page", 0)
+        scoped.pop("await", None)
         new_name = text.strip()
         if not new_name or len(new_name) > 64:
             await update.effective_message.reply_text("❌ 名称不能为空且不能超过 64 个字符，重命名已取消。", reply_markup=MAIN_KB)
@@ -1133,7 +1350,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # ── 页码跳转状态机 ──────────────────────────────
     if state == "list_jump":
-        context.user_data.pop("await", None)
+        scoped.pop("await", None)
         if not text.isdigit():
             await update.effective_message.reply_text("❌ 页码必须是数字，已取消跳转。", reply_markup=MAIN_KB)
             return
@@ -1158,7 +1375,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             # 保留等待状态，输错后可直接重试，不用重新点“添加对应”。
             await update.effective_message.reply_text(PATH_ADD_PROMPT)
             return
-        context.user_data.pop("await", None)
+        scoped.pop("await", None)
         await store.upsert_path_map(user_id, *rule)
         page_text, page_kb = await render_path_page(user_id)
         await update.effective_message.reply_html(
@@ -1169,7 +1386,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # ── /ai API 测试状态机 ─────────────────────────
     if state == "api_test":
-        context.user_data.pop("await", None)
+        scoped.pop("await", None)
         results = []
         for line in text.splitlines():
             line = line.strip()
@@ -1212,7 +1429,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # ── 内联排序状态机 ─────────────────────────────
     if state == "inline_sort":
-        context.user_data.pop("await", None)
+        scoped.pop("await", None)
         mode = text.strip()
         valid_modes = {"默认", "流量", "到期", "名称"}
         if mode not in valid_modes:
@@ -1258,7 +1475,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    if "=" in text and not text.lower().startswith("http") and "://" not in text.split("=", 1)[0]:
+    if (not is_group or addressed) and "=" in text and not text.lower().startswith("http") and "://" not in text.split("=", 1)[0]:
         rule = parse_path_rule(text)
         if rule is None:
             await update.effective_message.reply_text(PATH_ADD_PROMPT)
@@ -1343,6 +1560,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    if is_group and not addressed:
+        return
+
     await update.effective_message.reply_text(
         "未识别内容。可发送订阅链接、节点链接，或点击帮助菜单。",
         reply_markup=MAIN_KB,
@@ -1375,7 +1595,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await status.edit_text("文件读取失败，请稍后重试。")
         return
 
-    user_id = update.effective_user.id
+    user_id = scope_owner(update)
     existing_urls = {sub["url"] for sub in await store.list_subs_meta(user_id)}
     parsed_nodes = parse_nodes_from_text(text)
     structured = bool(parsed_nodes and ("proxies:" in text or "outbounds" in text))
@@ -1543,6 +1763,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # 管理员白名单拦截（其余管理指令如删除、刷新、导出必须经过授权）
     if await deny(update):
         return
+    user_id = scope_owner(update)
 
     await q.answer()
     if data == "noop":
@@ -1551,13 +1772,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await q.message.reply_text("🏠 主菜单", reply_markup=MAIN_KB)
         return
     if data == "list:jump":
-        if context.user_data is not None:
-            context.user_data["await"] = "list_jump"
+        interaction_data(update, context)["await"] = "list_jump"
         await q.message.reply_text("🔢 请输入要跳转的页码数字（如 2）。")
         return
     if data == "path:add":
-        if context.user_data is not None:
-            context.user_data["await"] = "path_add"
+        interaction_data(update, context)["await"] = "path_add"
         await q.message.reply_text(PATH_ADD_PROMPT)
         return
     if data.startswith("path:delete:"):
@@ -1761,10 +1980,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not sub:
             await q.edit_message_text("订阅不存在")
             return
-        if context.user_data is not None:
-            context.user_data["await"] = "sub_rename"
-            context.user_data["rename_sub_id"] = sub_id
-            context.user_data["rename_page"] = page
+        scoped = interaction_data(update, context)
+        scoped["await"] = "sub_rename"
+        scoped["rename_sub_id"] = sub_id
+        scoped["rename_page"] = page
         await q.message.reply_text(
             f"✏️ 请发送订阅「<b>{html.escape(sub['name'])}</b>」的新名称：\n<i>（输入 取消 可退出）</i>",
             parse_mode=ParseMode.HTML,
@@ -2014,7 +2233,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     user_id = iq.from_user.id
     user_name = iq.from_user.first_name or "用户"
-    if not allowed(user_id):
+    if not await allowed(user_id):
         await iq.answer(
             [],
             cache_time=5,
@@ -2191,6 +2410,7 @@ def build_app() -> Application:
     defaults = Defaults(link_preview_options=LinkPreviewOptions(is_disabled=True))
     app = Application.builder().token(BOT_TOKEN).defaults(defaults).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("auth", cmd_auth))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("expire", cmd_expire))

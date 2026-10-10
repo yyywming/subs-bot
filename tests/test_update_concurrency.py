@@ -65,8 +65,16 @@ class FakeUser:
     id = 1
 
 
+class FakeChat:
+    id = 1
+    type = "private"
+
+
 class FakeUpdate:
-    def __init__(self, cbq): self.callback_query = cbq; self.effective_user = FakeUser()
+    def __init__(self, cbq):
+        self.callback_query = cbq
+        self.effective_user = FakeUser()
+        self.effective_chat = FakeChat()
 
 
 class FakeCtx:
