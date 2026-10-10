@@ -53,6 +53,7 @@ from config import (
 from convert import (
     apply_path_maps,
     close_session,
+    decode_subscription_bytes,
     extract_share_links,
     fetch_subscription,
     format_bytes_gb,
@@ -97,15 +98,6 @@ def _document_suffix(filename: str) -> str:
     return ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
 
 
-def _decode_document(data: bytes) -> str:
-    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", "replace")
-
-
 def _unique(values: list[str]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
 
@@ -135,7 +127,8 @@ HELP_TEXT = (
     f"内联私密分享：输入 @{BOT_USERNAME} Share [x份数] [id用户ID] [s分钟] 分享内容\n\n"
     "<b>添加订阅</b>\n"
     "直接发送订阅链接（http/https）\n"
-    "名称优先使用订阅返回的配置名称\n\n"
+    "名称优先使用订阅返回的配置名称\n"
+    "TXT/Base64 节点列表与 YAML 配置可上传为订阅；同名文件重新上传覆盖更新。\n\n"
     "<b>临时节点</b>\n"
     "发送 ss/vmess/vless/... 链接加入临时列表\n"
     "/temp - 查看临时节点\n"
@@ -144,8 +137,8 @@ HELP_TEXT = (
     "格式：路径关键词 空格 配置名称\n"
     "例如：liangxinyun 良心云\n"
     "/path clear - 清空全部\n\n"
-    "<b>群组协作</b>\n"
-    "群内授权成员共用本群订阅；私聊与不同群之间独立。\n"
+    "<b>跨会话管理</b>\n"
+    "按用户 ID 管理个人订阅；同一用户群聊与私聊互通，不同用户独立。\n"
     "无关群消息不回复。可用 /list、列表按钮、独立链接，或 @机器人用户名 输入。\n"
     "群内编号详情请点击按钮，或提及/回复 Bot 后发送编号。\n\n"
     "<b>授权管理（仅管理员私聊）</b>\n"
@@ -185,7 +178,7 @@ async def deny(update: Update, quiet: bool = False) -> bool:
     """未授权返回 True。quiet=True 时不回复，供群里的普通消息使用。
 
     命令和回调保持默认 quiet=False，继续明确拒绝。判断的是 effective_user，
-    不是群共享订阅的 scope id。
+    不使用会话 chat id 判断用户权限。
     """
     user = update.effective_user
     if user is not None and await allowed(user.id):
@@ -329,10 +322,7 @@ def sub_token_url(token: str, kind: str = "clash") -> str:
 
 
 def scope_owner(update: Update) -> int:
-    """群/超群订阅归群 chat id；私聊及其它会话仍用用户 id。"""
-    chat = update.effective_chat
-    if chat.type in {"group", "supergroup"}:
-        return chat.id
+    """管理数据归当前用户：同一个人在群、超群和私聊里共用订阅。"""
     return update.effective_user.id
 
 
@@ -537,6 +527,9 @@ async def refresh_sub(
 
     抓取失败或解析出 0 个节点时，只写 last_error，不覆盖已缓存的 nodes_json。
     """
+    if sub["url"].startswith("uploaded://"):
+        # 静态文件只在重新上传时更新；不向不存在的远程地址发请求。
+        return await store.update_sub(user_id, int(sub["id"]), return_meta=meta_only, last_error=None) or sub
     nodes, meta, err = await fetch_subscription(sub["url"])
     fields: dict[str, Any] = {
         "last_error": err,
@@ -1589,33 +1582,30 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if len(raw) > MAX_DOCUMENT_BYTES:
             await status.edit_text("文件过大，下载后超过大小限制。")
             return
-        text = _decode_document(raw)
+        text = decode_subscription_bytes(raw)
     except Exception:
         log.exception("document download failed")
         await status.edit_text("文件读取失败，请稍后重试。")
         return
 
     user_id = scope_owner(update)
-    existing_urls = {sub["url"] for sub in await store.list_subs_meta(user_id)}
     parsed_nodes = parse_nodes_from_text(text)
-    structured = bool(parsed_nodes and ("proxies:" in text or "outbounds" in text))
     created: list[tuple[str, int]] = []
     failures: list[str] = []
     skipped = 0
-    temp_count = 0
 
-    if structured:
+    if parsed_nodes:
         name = filename.rsplit("/", 1)[-1].rsplit(".", 1)[0][:64] or "导入配置"
-        # 结构化配置去重：如果已有同名本地配置，直接更新其节点，避免重复创建
+        # 节点文件按名称更新同一导入订阅，TXT 与 YAML 使用相同列表入口。
         existing_imported = [s for s in await store.list_subs_meta(user_id) if s.get("name") == name and s.get("url", "").startswith("uploaded://")]
         if existing_imported:
             old_sub = existing_imported[0]
-            await store.update_sub(user_id, int(old_sub["id"]), nodes_json=json.dumps(parsed_nodes[:MAX_IMPORTED_NODES], ensure_ascii=False))
+            await store.update_sub(user_id, int(old_sub["id"]), nodes_json=json.dumps(parsed_nodes[:MAX_IMPORTED_NODES], ensure_ascii=False), last_error=None)
             created.append((f"{name} (已覆盖更新)", len(parsed_nodes[:MAX_IMPORTED_NODES])))
         else:
             local = await store.add_imported_sub(user_id, name, parsed_nodes[:MAX_IMPORTED_NODES])
             created.append((str(local["name"]), len(parsed_nodes[:MAX_IMPORTED_NODES])))
-    else:
+    if not parsed_nodes or all(node.get("share") for node in parsed_nodes):
         existing_url_norm = {sub["url"].rstrip("/"): sub for sub in await store.list_subs_meta(user_id)}
         urls = _unique(value.rstrip(".,;:!?)]}>\"\'") for value in re.findall(r"https?://[^\s<>\"]+", text))
         for url in urls[:MAX_IMPORTED_SUBSCRIPTIONS]:
@@ -1642,21 +1632,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     created.append((str(updated.get("name") or name), updated['node_count']))
             except Exception as exc:
                 failures.append(f"{name}: {exc}")
-        links = _unique(extract_share_links(text))[:MAX_IMPORTED_NODES]
-        for link in links:
-            await store.add_temp(user_id, link, node_name_from_url(link))
-        temp_count = len(links)
 
     lines = [f"✅ 已处理文件：{html.escape(filename)}"]
     for name, count in created:
         lines.append(f"已添加：{html.escape(name)}（{count} 节点）")
-    if temp_count:
-        lines.append(f"已加入临时节点：{temp_count} 条")
     if skipped:
         lines.append(f"已跳过重复订阅：{skipped} 条")
     if failures:
         lines.append("失败：" + "；".join(html.escape(item) for item in failures[:8]))
-    if not created and not temp_count and not failures and not skipped:
+    if not created and not failures and not skipped:
         lines.append("未识别到订阅或节点内容。")
     await status.edit_text("\n".join(lines), reply_markup=MAIN_KB, parse_mode=ParseMode.HTML)
 

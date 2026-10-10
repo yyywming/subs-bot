@@ -64,38 +64,136 @@ def _b64decode(data: str) -> bytes | None:
         return None
 
 
-def decode_maybe_base64(text: str) -> str:
-    raw = _b64decode(text)
+def _strip_leading_bom(text: str) -> str:
+    return text.lstrip("\ufeff") if text else ""
+
+
+def _normalize_charset(charset: str | None) -> str | None:
+    if charset is None:
+        return None
+    name = str(charset).strip().strip("'\"").lower()
+    if not name:
+        return None
+    name = name.split(";", 1)[0].strip()
+    if not name:
+        return None
+    return {
+        "utf8": "utf-8-sig",
+        "utf-8": "utf-8-sig",
+        "utf_8": "utf-8-sig",
+        "utf-8-sig": "utf-8-sig",
+        "utf16": "utf-16",
+        "utf-16le": "utf-16-le",
+        "utf-16be": "utf-16-be",
+    }.get(name, name)
+
+
+def decode_subscription_bytes(raw: bytes, charset: str | None = None) -> str:
+    """把订阅正文解码成文本。
+
+    优先认 UTF-8 / UTF-16 BOM，其次用响应声明的 charset，再严格回退
+    UTF-8 与 GB18030。不用 errors=ignore，避免多字节节点名被丢掉。
+    """
+    if isinstance(raw, bytearray):
+        raw = bytes(raw)
+    if not isinstance(raw, bytes):
+        raise TypeError("subscription body must be bytes")
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")) and not raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        try:
+            return _strip_leading_bom(raw.decode("utf-16"))
+        except UnicodeDecodeError:
+            pass
+    if raw.startswith(b"\xef\xbb\xbf"):
+        try:
+            return raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            pass
+    encodings: list[str] = []
+    declared = _normalize_charset(charset)
+    if declared:
+        encodings.append(declared)
+    for enc in ("utf-8-sig", "utf-8", "gb18030"):
+        if enc not in encodings:
+            encodings.append(enc)
+    for enc in encodings:
+        try:
+            return _strip_leading_bom(raw.decode(enc))
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return _strip_leading_bom(raw.decode("utf-8", errors="replace"))
+
+
+def _decode_payload_bytes(data: bytes, *, allow_gb18030: bool = True) -> str | None:
+    """解码 base64 内层字节。失败返回 None，不用替换字符凑节点。
+
+    折行的单行片段不走 GB18030：它几乎能解码任意字节，会把片段误认成节点。
+    """
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")) and not data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            return None
+    if data.startswith(b"\xef\xbb\xbf"):
+        try:
+            return data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return None
+    encodings = ("utf-8", "gb18030") if allow_gb18030 else ("utf-8",)
+    for enc in encodings:
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def _decode_base64_document(text: str) -> str | None:
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) < 16 or len(compact) % 4 == 1:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9+/_=-]+", compact):
+        return None
+    raw = _b64decode(compact)
     if not raw:
-        return text
-    try:
-        decoded = raw.decode("utf-8")
-    except Exception:
-        return text
-    if "://" in decoded or "proxies:" in decoded or decoded.lstrip().startswith("{"):
-        return decoded
-    return text
+        return None
+    payload = _decode_payload_bytes(raw)
+    if not payload:
+        return None
+    payload = _strip_leading_bom(payload).strip()
+    return payload or None
+
+
+def decode_maybe_base64(text: str) -> str:
+    stripped = _strip_leading_bom(text or "").strip()
+    if not stripped:
+        return ""
+    payload = _decode_base64_document(stripped)
+    if not payload or payload == stripped:
+        return stripped
+    if _structured_nodes(payload) or extract_share_links(payload):
+        return payload
+    return stripped
 
 
 def extract_share_links(text: str) -> list[str]:
     links: list[str] = []
-    for line in text.splitlines():
-        line = line.strip()
+    for line in _strip_leading_bom(text).splitlines():
+        line = line.strip().lstrip("\ufeff")
         if not line:
             continue
         if PROTO_RE.match(line):
             links.append(line)
             continue
         raw = _b64decode(line)
-        if raw:
-            try:
-                decoded = raw.decode("utf-8")
-            except Exception:
-                continue
-            for sub in decoded.splitlines():
-                sub = sub.strip()
-                if PROTO_RE.match(sub):
-                    links.append(sub)
+        if not raw:
+            continue
+        decoded = _decode_payload_bytes(raw, allow_gb18030=False)
+        if not decoded:
+            continue
+        for sub in _strip_leading_bom(decoded).splitlines():
+            sub = sub.strip().lstrip("\ufeff")
+            if PROTO_RE.match(sub):
+                links.append(sub)
     return links
 
 
@@ -111,39 +209,53 @@ def node_name_from_url(url: str) -> str:
 def parse_vmess(url: str) -> dict[str, Any] | None:
     try:
         raw = url.split("://", 1)[1]
-        data = json.loads(_b64decode(raw) or b"{}")
+        decoded = _b64decode(raw)
+        if not decoded:
+            return None
+        data = json.loads(decoded)
+        if not isinstance(data, dict):
+            return None
+        server = data.get("add")
+        if not isinstance(server, str) or not server:
+            return None
+        name = data.get("ps") or "vmess"
+        node: dict[str, Any] = {
+            "name": str(name),
+            "type": "vmess",
+            "server": server,
+            "port": int(data.get("port") or 0),
+            "uuid": data.get("id"),
+            "alterId": int(data.get("aid") or 0),
+            "cipher": data.get("scy") or "auto",
+            "network": data.get("net") or "tcp",
+            "tls": True if data.get("tls") in ("tls", True, "1") else False,
+            "share": url,
+        }
+        if data.get("sni") or data.get("host"):
+            node["servername"] = data.get("sni") or data.get("host")
+        if data.get("path"):
+            node["ws-opts"] = {"path": data.get("path"), "headers": {"Host": data.get("host") or ""}}
+        return node
     except Exception:
         return None
-    name = data.get("ps") or "vmess"
-    node = {
-        "name": str(name),
-        "type": "vmess",
-        "server": data.get("add"),
-        "port": int(data.get("port") or 0),
-        "uuid": data.get("id"),
-        "alterId": int(data.get("aid") or 0),
-        "cipher": data.get("scy") or "auto",
-        "network": data.get("net") or "tcp",
-        "tls": True if data.get("tls") in ("tls", True, "1") else False,
-        "share": url,
-    }
-    if data.get("sni") or data.get("host"):
-        node["servername"] = data.get("sni") or data.get("host")
-    if data.get("path"):
-        node["ws-opts"] = {"path": data.get("path"), "headers": {"Host": data.get("host") or ""}}
-    return node
 
 
 def parse_share_link(url: str) -> dict[str, Any] | None:
+    try:
+        return _parse_share_link(url)
+    except Exception:
+        return None
+
+
+def _parse_share_link(url: str) -> dict[str, Any] | None:
     lower = url.lower()
     if lower.startswith("vmess://"):
         return parse_vmess(url)
     name = node_name_from_url(url)
-    try:
-        u = urlparse(url.split("#", 1)[0])
-    except Exception:
-        return {"name": name, "type": "unknown", "share": url}
-    scheme = (u.scheme or "unknown").lower()
+    u = urlparse(url.split("#", 1)[0])
+    scheme = (u.scheme or "").lower()
+    if not scheme:
+        return None
     if scheme == "hy2":
         scheme = "hysteria2"
     host = u.hostname or ""
@@ -170,25 +282,10 @@ def parse_share_link(url: str) -> dict[str, Any] | None:
             "skip-cert-verify": qs.get("allowInsecure") in ("1", "true", "True"),
         })
     elif scheme == "ss":
-        # ss://base64(method:pass)@host:port or ss://method:pass@host:port
-        method = ""
-        pwd = ""
-        if username and ":" not in username and not password:
-            decoded = _b64decode(username)
-            if decoded and b":" in decoded:
-                method, pwd = decoded.decode("utf-8", "ignore").split(":", 1)
-        elif username and password:
-            method, pwd = username, password
-        elif "@" not in url:
-            body = url.split("://", 1)[1].split("#", 1)[0]
-            decoded = _b64decode(body)
-            if decoded and b"@" in decoded:
-                method_pass, hostport = decoded.decode("utf-8", "ignore").split("@", 1)
-                method, pwd = method_pass.split(":", 1)
-                if ":" in hostport:
-                    host, port_s = hostport.rsplit(":", 1)
-                    node["server"], node["port"] = host, int(port_s)
-        node.update({"cipher": method or "aes-256-gcm", "password": pwd})
+        # ss://base64(method:pass)@host:port、ss://method:pass@host:port
+        # 或整段 base64(method:pass@host:port)。解不出服务器就丢弃，不填默认密码。
+        if not _fill_ss_fields(url, node, username, password):
+            return None
     elif scheme == "hysteria2":
         node.update({
             "password": username or password or qs.get("auth") or "",
@@ -209,48 +306,147 @@ def parse_share_link(url: str) -> dict[str, Any] | None:
     return node
 
 
-def parse_nodes_from_text(text: str) -> list[dict[str, Any]]:
-    text = decode_maybe_base64(text.strip())
+def _fill_ss_fields(url: str, node: dict[str, Any], username: str, password: str) -> bool:
+    method = ""
+    pwd = ""
+    parsed = False
+    if username and ":" not in username and not password:
+        decoded = _b64decode(username)
+        if decoded and b":" in decoded:
+            method, pwd = decoded.decode("utf-8", "ignore").split(":", 1)
+            parsed = bool(node.get("server"))
+    elif username and password:
+        method, pwd = username, password
+        parsed = bool(node.get("server"))
+    elif "@" not in url:
+        body = url.split("://", 1)[1].split("#", 1)[0]
+        decoded = _b64decode(body)
+        if decoded and b"@" in decoded:
+            method_pass, hostport = decoded.decode("utf-8", "ignore").split("@", 1)
+            method, pwd = method_pass.split(":", 1)
+            if ":" in hostport:
+                host, port_s = hostport.rsplit(":", 1)
+                node["server"], node["port"] = host, int(port_s)
+                parsed = bool(host)
+    if not parsed:
+        return False
+    node.update({"cipher": method or "aes-256-gcm", "password": pwd})
+    return True
+
+
+_SINGBOX_SKIP_TYPES = frozenset({"direct", "block", "dns", "selector", "urltest"})
+
+
+def _is_proxy_mapping(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    name = item.get("name")
+    typ = item.get("type")
+    server = item.get("server")
+    return (
+        isinstance(name, str)
+        and bool(name.strip())
+        and isinstance(typ, str)
+        and bool(typ.strip())
+        and isinstance(server, str)
+        and bool(server.strip())
+    )
+
+
+def _nodes_from_proxy_list(items: list[Any]) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
-    # clash yaml
-    if "proxies:" in text:
+    for item in items:
+        if not _is_proxy_mapping(item):
+            continue
+        node = dict(item)
+        node.setdefault("share", "")
+        nodes.append(node)
+    return nodes
+
+
+def _nodes_from_singbox_outbounds(outbounds: list[Any]) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+    for ob in outbounds:
+        if not isinstance(ob, dict):
+            continue
+        if ob.get("type") in _SINGBOX_SKIP_TYPES:
+            continue
+        name = ob.get("tag") or ob.get("type") or "node"
+        node: dict[str, Any] = {"name": name, "type": ob.get("type"), "share": ""}
+        node.update({k: v for k, v in ob.items() if k not in ("tag",)})
+        nodes.append(node)
+    return nodes
+
+
+def _nodes_from_loaded(data: Any) -> list[dict[str, Any]]:
+    """只取 Clash proxies、独立节点列表或 sing-box outbounds。
+
+    rules、proxy-groups 和其它元数据映射不会被当成节点。
+    """
+    if isinstance(data, list):
+        return _nodes_from_proxy_list(data)
+    if not isinstance(data, dict):
+        return []
+    proxies = data.get("proxies")
+    if isinstance(proxies, list):
+        return _nodes_from_proxy_list(proxies)
+    outbounds = data.get("outbounds")
+    if isinstance(outbounds, list):
+        return _nodes_from_singbox_outbounds(outbounds)
+    return []
+
+
+def _structured_nodes(text: str) -> list[dict[str, Any]]:
+    text = _strip_leading_bom(text).strip()
+    if not text:
+        return []
+    stripped = text.lstrip()
+    if stripped.startswith(("{", "[")):
         try:
-            data = yaml.safe_load(text)
-            proxies = data.get("proxies") if isinstance(data, dict) else None
-            if isinstance(proxies, list):
-                for p in proxies:
-                    if isinstance(p, dict) and p.get("name"):
-                        item = dict(p)
-                        item.setdefault("share", "")
-                        nodes.append(item)
-                if nodes:
-                    return nodes
+            loaded = json.loads(stripped)
         except Exception:
-            pass
-    # sing-box json
-    if text.lstrip().startswith("{"):
-        try:
-            data = json.loads(text)
-            outbounds = data.get("outbounds") if isinstance(data, dict) else None
-            if isinstance(outbounds, list):
-                for ob in outbounds:
-                    if not isinstance(ob, dict):
-                        continue
-                    if ob.get("type") in ("direct", "block", "dns", "selector", "urltest"):
-                        continue
-                    name = ob.get("tag") or ob.get("type") or "node"
-                    node = {"name": name, "type": ob.get("type"), "share": ""}
-                    node.update({k: v for k, v in ob.items() if k not in ("tag",)})
-                    nodes.append(node)
-                if nodes:
-                    return nodes
-        except Exception:
-            pass
+            loaded = None
+        else:
+            nodes = _nodes_from_loaded(loaded)
+            if nodes:
+                return nodes
+    try:
+        loaded = yaml.safe_load(text)
+    except Exception:
+        return []
+    return _nodes_from_loaded(loaded)
+
+
+def _nodes_from_shares(text: str) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
     for link in extract_share_links(text):
-        node = parse_share_link(link)
+        try:
+            node = parse_share_link(link)
+        except Exception:
+            continue
         if node:
             nodes.append(node)
     return nodes
+
+
+def _nodes_from_plain(text: str) -> list[dict[str, Any]]:
+    nodes = _structured_nodes(text)
+    if nodes:
+        return nodes
+    return _nodes_from_shares(text)
+
+
+def parse_nodes_from_text(text: str) -> list[dict[str, Any]]:
+    text = _strip_leading_bom(text or "").strip()
+    if not text:
+        return []
+    # 整段都是 Base64 时先解码。折行后逐行解会截断 URI，不能抢在完整文档前面。
+    decoded = decode_maybe_base64(text)
+    if decoded and decoded != text:
+        nodes = _nodes_from_plain(decoded)
+        if nodes:
+            return nodes
+    return _nodes_from_plain(text)
 
 
 def _decode_profile_title(raw: str) -> str:
@@ -379,7 +575,7 @@ async def fetch_subscription(url: str, timeout: int = 25) -> tuple[list[dict[str
                 body = await resp.content.read(MAX_SUBSCRIPTION_BYTES + 1)
                 if len(body) > MAX_SUBSCRIPTION_BYTES:
                     return [], meta, "订阅响应过大"
-                text = body.decode(resp.charset or "utf-8", errors="ignore")
+                text = decode_subscription_bytes(body, resp.charset)
                 nodes = parse_nodes_from_text(text)
                 return nodes, meta, None
         return [], {"traffic_used": None, "traffic_total": None, "expire_at": None, "profile_name": None}, "订阅重定向次数过多"

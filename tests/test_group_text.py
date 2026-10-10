@@ -67,30 +67,43 @@ class GroupTextTests(unittest.IsolatedAsyncioTestCase):
                     update = self.update(text, uid)
                     await B.handle_text(update, self.context)
                     self.assertEqual(update.effective_message.replies, [])
-        self.assertEqual(await B.store.list_path_maps(-100123), [])
+        self.assertEqual(await B.store.list_subs_meta(1), [])
+        self.assertEqual(await B.store.list_temp(1), [])
+        self.assertEqual(await B.store.list_path_maps(1), [])
+        self.assertEqual(await B.store.list_subs_meta(2), [])
         self.assertEqual(await B.store.list_subs_meta(-100123), [])
+        self.assertEqual(await B.store.list_temp(-100123), [])
+        self.assertEqual(await B.store.list_path_maps(-100123), [])
 
-    async def test_exact_menu_still_displays_group_list(self):
-        await B.store.add_imported_sub(-100123, "shared-sub", [])
-        await B.store.add_imported_sub(1, "private-sub", [])
+    async def test_exact_menu_shows_own_personal_rows(self):
+        await B.store.add_imported_sub(1, "own-personal", [])
+        await B.store.add_imported_sub(2, "other-private", [])
+        await B.store.add_imported_sub(-100123, "legacy-group", [])
         update = self.update("订阅列表")
         await B.handle_text(update, self.context)
         labels = [button.text for row in update.effective_message.markups[0].inline_keyboard for button in row]
-        self.assertTrue(any("shared-sub" in label for label in labels))
-        self.assertFalse(any("private-sub" in label for label in labels))
+        self.assertTrue(any("own-personal" in label for label in labels))
+        self.assertFalse(any("other-private" in label for label in labels))
+        self.assertFalse(any("legacy-group" in label for label in labels))
+        self.assertEqual(
+            [row["name"] for row in await B.store.list_subs_meta(-100123)],
+            ["legacy-group"],
+        )
 
-    async def test_deliberate_node_import_is_shared(self):
+    async def test_deliberate_node_import_belongs_to_sender(self):
         update = self.update("vless://id@example.invalid:443#group-node")
         await B.handle_text(update, self.context)
-        rows = await B.store.list_temp(-100123)
+        rows = await B.store.list_temp(1)
         self.assertEqual([(r["name"], r["url"]) for r in rows], [
             ("group-node", "vless://id@example.invalid:443#group-node")
         ])
-        self.assertEqual(await B.store.list_temp(1), [])
+        self.assertEqual(await B.store.list_temp(-100123), [])
+        self.assertEqual(await B.store.list_temp(2), [])
 
-    async def test_mention_and_bot_reply_allow_number_selection(self):
-        await B.store.add_imported_sub(-100123, "shared-detail", [{"name": "n", "type": "vless"}])
-        await B.store.add_imported_sub(1, "private-detail", [{"name": "p", "type": "vless"}])
+    async def test_mention_and_bot_reply_show_own_detail(self):
+        await B.store.add_imported_sub(1, "own-detail", [{"name": "n", "type": "vless"}])
+        await B.store.add_imported_sub(2, "other-private", [{"name": "p", "type": "vless"}])
+        await B.store.add_imported_sub(-100123, "legacy-detail", [{"name": "g", "type": "vless"}])
         for text, reply in (
             ("@smoke_bot 1", None),
             ("1", SimpleNamespace(from_user=SimpleNamespace(id=999))),
@@ -98,8 +111,9 @@ class GroupTextTests(unittest.IsolatedAsyncioTestCase):
             update = self.update(text, reply=reply)
             await B.handle_text(update, self.context)
             detail = "\n".join(update.effective_message.replies)
-            self.assertIn("shared-detail", detail)
-            self.assertNotIn("private-detail", detail)
+            self.assertIn("own-detail", detail)
+            self.assertNotIn("other-private", detail)
+            self.assertNotIn("legacy-detail", detail)
 
     async def test_replying_to_another_bot_does_not_trigger_response(self):
         update = self.update("无关消息", reply=SimpleNamespace(from_user=SimpleNamespace(id=998)))
@@ -107,11 +121,12 @@ class GroupTextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update.effective_message.replies, [])
 
 
-    async def test_unauthorized_explicit_import_cannot_mutate_group(self):
+    async def test_unauthorized_explicit_import_cannot_mutate_personal_or_legacy(self):
         update = self.update("@smoke_bot vless://id@example.invalid:443#denied", uid=2)
         await B.handle_text(update, self.context)
-        self.assertEqual(await B.store.list_temp(-100123), [])
+        self.assertEqual(await B.store.list_temp(1), [])
         self.assertEqual(await B.store.list_temp(2), [])
+        self.assertEqual(await B.store.list_temp(-100123), [])
 
     async def test_senderless_channel_post_cannot_import_or_reply(self):
         update = self.update("vless://id@example.invalid:443#channel")
@@ -119,6 +134,7 @@ class GroupTextTests(unittest.IsolatedAsyncioTestCase):
         update.effective_user = None
         await B.handle_text(update, self.context)
         self.assertEqual(update.effective_message.replies, [])
+        self.assertEqual(await B.store.list_temp(1), [])
         self.assertEqual(await B.store.list_temp(-100123), [])
 
 
