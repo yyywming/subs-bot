@@ -58,6 +58,7 @@ from convert import (
     fetch_subscription,
     format_bytes_gb,
     format_expire,
+    get_session,
     node_name_from_url,
     parse_nodes_from_text,
     remain_text,
@@ -67,6 +68,7 @@ from convert import (
     to_share_links,
     to_singbox,
     to_surge,
+    _check_public_url,
 )
 from db import Store, nodes_of
 
@@ -1395,19 +1397,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if not re.match(r"^https?://", api_url) or not key:
                 results.append("⚠️ 格式错误：请用 API地址|Key（每行一组）")
                 continue
-            # 兼容 OpenAI 兼容服务：优先探测 /v1/models，根地址则自动补路径。
+            # API 探测只允许公网 HTTP(S)，并逐跳禁止重定向，避免把服务端变成 SSRF 代理。
             probe_url = api_url if api_url.rstrip("/").endswith(("/models", "/chat/completions")) else api_url + "/v1/models"
             t0 = time.time()
             try:
+                await _check_public_url(probe_url)
                 timeout = aiohttp.ClientTimeout(total=15)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(
-                        probe_url,
-                        headers={"Authorization": f"Bearer {key}", "X-API-Key": key},
-                    ) as resp:
-                        elapsed = time.time() - t0
-                        status = resp.status
-                        body = (await resp.text())[:120].replace("\n", " ")
+                session = await get_session()
+                async with session.get(
+                    probe_url,
+                    headers={"Authorization": f"Bearer {key}", "X-API-Key": key},
+                    timeout=timeout,
+                    allow_redirects=False,
+                ) as resp:
+                    elapsed = time.time() - t0
+                    status = resp.status
+                    body = (await resp.text())[:120].replace("\n", " ")
                 # 不回显 Key；只展示状态、延迟和有限响应摘要。
                 mark = "✅" if 200 <= status < 300 else "❌"
                 results.append(f"{mark} {api_url} → HTTP {status} ({elapsed:.1f}s) {body}")
@@ -2067,15 +2072,16 @@ async def http_sub(request: web.Request) -> web.Response:
         return web.Response(status=404, text="not found")
     maps = {m["node_name"]: m["remark"] for m in await store.list_path_maps(int(sub["user_id"]))}
     nodes = apply_path_maps(nodes_of(sub), maps)
+    no_store = {"Cache-Control": "no-store, private"}
     if kind in ("base64", "v2ray", "mixed"):
-        return web.Response(text=to_base64_sub(nodes), content_type="text/plain")
+        return web.Response(text=to_base64_sub(nodes), content_type="text/plain", headers=no_store)
     if kind in ("singbox", "sing-box"):
-        return web.Response(text=to_singbox(nodes), content_type="application/json")
+        return web.Response(text=to_singbox(nodes), content_type="application/json", headers=no_store)
     if kind == "surge":
-        return web.Response(text=to_surge(nodes), content_type="text/plain")
+        return web.Response(text=to_surge(nodes), content_type="text/plain", headers=no_store)
     if kind in ("qx", "quantumult", "quantumultx"):
-        return web.Response(text=to_qx(nodes), content_type="text/plain")
-    return web.Response(text=to_clash(nodes), content_type="text/yaml")
+        return web.Response(text=to_qx(nodes), content_type="text/plain", headers=no_store)
+    return web.Response(text=to_clash(nodes), content_type="text/yaml", headers=no_store)
 
 
 async def http_agg(request: web.Request) -> web.Response:
@@ -2099,15 +2105,16 @@ async def http_agg(request: web.Request) -> web.Response:
     else:
         return web.Response(status=404, text="not found")
     kind = request.match_info.get("kind", "clash").lower()
+    no_store = {"Cache-Control": "no-store, private"}
     if kind in ("base64", "v2ray", "mixed"):
-        return web.Response(text=to_base64_sub(nodes), content_type="text/plain")
+        return web.Response(text=to_base64_sub(nodes), content_type="text/plain", headers=no_store)
     if kind in ("singbox", "sing-box"):
-        return web.Response(text=to_singbox(nodes), content_type="application/json")
+        return web.Response(text=to_singbox(nodes), content_type="application/json", headers=no_store)
     if kind == "surge":
-        return web.Response(text=to_surge(nodes), content_type="text/plain")
+        return web.Response(text=to_surge(nodes), content_type="text/plain", headers=no_store)
     if kind in ("qx", "quantumult", "quantumultx"):
-        return web.Response(text=to_qx(nodes), content_type="text/plain")
-    return web.Response(text=to_clash(nodes), content_type="text/yaml")
+        return web.Response(text=to_qx(nodes), content_type="text/plain", headers=no_store)
+    return web.Response(text=to_clash(nodes), content_type="text/yaml", headers=no_store)
 
 
 
@@ -2199,7 +2206,11 @@ def parse_share_query(raw: str) -> tuple[int, int | None, int, str] | None:
         if lower.startswith("x") and lower[1:].isdigit():
             max_views = max(1, min(100, int(lower[1:])))
         elif lower.startswith("id") and lower[2:].isdigit():
-            target_user_id = int(lower[2:])
+            parsed_target = parse_tg_user_id(lower[2:])
+            if parsed_target is None:
+                content_parts.append(p)
+            else:
+                target_user_id = parsed_target
         elif lower.startswith("s") and lower[1:].isdigit():
             duration_minutes = max(1, min(10080, int(lower[1:])))
         else:

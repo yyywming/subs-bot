@@ -89,9 +89,7 @@ curl http://localhost:8787/health
 journalctl -u subs-bot -f
 ```
 
-需要 Python 3.11+、systemd 和 Git。`.env` 中的 Token、授权名单和实际服务地址不要提交到仓库。同一 Bot Token 只运行一个轮询实例，避免 Telegram `getUpdates` 冲突。
-
-默认 HTTP 端口为 8787；自定义端口时，健康检查使用对应的 `HTTP_PORT`。建议通过反向代理提供 HTTPS，并将 HTTP 服务绑定到回环地址。
+- 默认 HTTP 服务仅绑定 `127.0.0.1:8787`；如需公网访问，应通过反向代理提供 HTTPS，并显式配置 `HTTP_HOST`。订阅和聚合响应使用 `Cache-Control: no-store`，避免缓存敏感节点凭据。
 
 ## 迁移数据
 

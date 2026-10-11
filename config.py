@@ -79,7 +79,7 @@ ALLOWED_USER_IDS = parse_user_id_set(os.environ.get("ALLOWED_USER_IDS", ""))
 # 不把第一个使用者提升为管理员。管理员集合为空时，Bot 内授权管理关闭。
 ADMIN_USER_IDS = resolve_admin_ids(ALLOWED_USER_IDS, os.environ.get("ADMIN_USER_IDS"))
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8787").rstrip("/")
-HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
+HTTP_HOST = os.environ.get("HTTP_HOST", "127.0.0.1")
 HTTP_PORT = _env_int("HTTP_PORT", 8787, 1, 65535)
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(ROOT / "data")))
 DB_PATH = Path(os.environ.get("DB_PATH", str(DATA_DIR / "subs.db")))
@@ -89,3 +89,10 @@ MAX_IMPORTED_SUBSCRIPTIONS = _env_int("MAX_IMPORTED_SUBSCRIPTIONS", 20, 1, 100)
 # 批量更新订阅的并发上限。太高会让机场把并发请求当刷探测，8 是实测稳妥值。
 UPDATE_CONCURRENCY = _env_int("UPDATE_CONCURRENCY", 8, 1, 32)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    DATA_DIR.chmod(0o700)
+    if DB_PATH.exists():
+        DB_PATH.chmod(0o600)
+except OSError:
+    # Windows and restricted filesystems may not expose POSIX permissions.
+    pass

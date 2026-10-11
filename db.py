@@ -177,8 +177,21 @@ class Store:
         await db.execute("PRAGMA synchronous=NORMAL")
         await db.commit()
         await self._backfill_node_count(db)
+        await self._cleanup_expired(db)
         self._conn = db
         self._ready = True
+
+    async def _cleanup_expired(self, db: aiosqlite.Connection) -> None:
+        """删除已不可用的历史记录；不改变仍在有效期内的功能数据。"""
+        now = int(time.time())
+        await db.execute("DELETE FROM shares WHERE expire_at < ?", (now,))
+        await db.execute(
+            "DELETE FROM share_claims WHERE share_code NOT IN (SELECT code FROM shares)"
+        )
+        await db.execute(
+            "DELETE FROM deleted_subs WHERE deleted_at < ?", (now - 30 * 86400,)
+        )
+        await db.commit()
 
     async def _backfill_node_count(self, db: aiosqlite.Connection) -> None:
         """给历史数据回填 node_count。只跑一次，靠 meta 表记标记位。
@@ -526,6 +539,9 @@ class Store:
         target_user_id: int | None = None,
         duration_minutes: int = 10,
     ) -> str:
+        _require_tg_user_id(sender_id)
+        if target_user_id is not None:
+            _require_tg_user_id(target_user_id)
         code = secrets.token_urlsafe(8)
         now = int(time.time())
         expire_at = now + max(1, duration_minutes) * 60

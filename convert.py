@@ -42,6 +42,7 @@ async def get_session() -> aiohttp.ClientSession:
             limit_per_host=8,     # 单域名上限，防止把小机场打崩
             ttl_dns_cache=300,    # DNS 缓存 5 分钟，省掉重复解析
             enable_cleanup_closed=True,
+            resolver=PublicResolver(),
         )
         _SESSION = aiohttp.ClientSession(connector=connector)
     return _SESSION
@@ -521,28 +522,63 @@ def parse_subscription_headers(headers: aiohttp.typedefs.LooseHeaders | dict[str
     return info
 
 
+def _is_public_ip(raw_ip: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(raw_ip)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return _is_public_ip(str(ip.ipv4_mapped))
+    return ip.is_global and not (ip.is_multicast or ip.is_reserved)
+
+
+class PublicResolver:
+    """aiohttp resolver that rejects private addresses at connection time."""
+
+    def __init__(self) -> None:
+        self._resolver = aiohttp.resolver.ThreadedResolver()
+
+    async def resolve(
+        self, host: str, port: int = 0, family: int = socket.AF_UNSPEC
+    ) -> list[dict[str, Any]]:
+        resolved = await self._resolver.resolve(host, port, family)
+        blocked = next(
+            (
+                item.get("host")
+                for item in resolved
+                if not _is_public_ip(str(item.get("host") or ""))
+            ),
+            None,
+        )
+        if blocked is not None:
+            raise OSError(f"连接目标为内网/保留地址: {blocked}")
+        return resolved
+
+    async def close(self) -> None:
+        await self._resolver.close()
+
+
 async def _check_public_url(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"}:
-        raise ValueError("订阅 URL 仅支持 http/https")
+        raise ValueError("仅支持 http/https URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URL 不允许携带用户名或密码")
     host = parsed.hostname or ""
     if not host:
-        raise ValueError("订阅 URL 缺少主机名")
+        raise ValueError("URL 缺少主机名")
     try:
         infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
     except socket.gaierror as exc:
-        raise ValueError(f"订阅主机名解析失败: {exc}") from exc
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            raise ValueError(f"订阅地址指向内网/保留地址: {host} -> {ip}")
+        raise ValueError(f"主机名解析失败: {exc}") from exc
+    addresses = {str(info[4][0]) for info in infos}
+    blocked = next((ip for ip in addresses if not _is_public_ip(ip)), None)
+    if blocked is not None:
+        raise ValueError(f"URL 指向内网/保留地址: {host} -> {blocked}")
+
+
+
+
 
 
 async def fetch_subscription(url: str, timeout: int = 25) -> tuple[list[dict[str, Any]], dict[str, Any], str | None]:

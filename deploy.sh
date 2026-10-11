@@ -40,7 +40,8 @@ if [ ! -f "${INSTALL_DIR}/.env" ]; then
     exit 0
 fi
 
-chmod 600 "${INSTALL_DIR}/.env" || true
+chmod 640 "${INSTALL_DIR}/.env" || true
+
 
 _env_get() {
     # shellcheck disable=SC1091
@@ -52,6 +53,14 @@ _env_get() {
         eval "printf '%s' \"\${$1-}\""
     )
 }
+if ! id -u subs-bot >/dev/null 2>&1; then
+    useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin subs-bot
+fi
+DATA_DIR_VALUE="$(_env_get DATA_DIR 2>/dev/null || true)"
+DATA_DIR_VALUE="${DATA_DIR_VALUE:-${INSTALL_DIR}/data}"
+install -d -m 700 -o subs-bot -g subs-bot "${DATA_DIR_VALUE}"
+chown -R subs-bot:subs-bot "${DATA_DIR_VALUE}"
+chown root:subs-bot "${INSTALL_DIR}/.env"
 
 BOT_TOKEN_VALUE="$(_env_get BOT_TOKEN)"
 if [ -z "${BOT_TOKEN_VALUE}" ]; then
@@ -65,6 +74,7 @@ sed -i \
     -e "s#WorkingDirectory=.*#WorkingDirectory=${INSTALL_DIR}#" \
     -e "s#EnvironmentFile=.*#EnvironmentFile=${INSTALL_DIR}/.env#" \
     -e "s#ExecStart=.*#ExecStart=${VENV_DIR}/bin/python ${INSTALL_DIR}/bot.py#" \
+    -e "s#ReadWritePaths=.*#ReadWritePaths=${DATA_DIR_VALUE}#" \
     /etc/systemd/system/subs-bot.service
 
 systemctl daemon-reload

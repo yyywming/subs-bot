@@ -10,7 +10,14 @@ EnvironmentFile=/opt/subs-bot/.env
 ExecStart=/opt/subs-bot/.venv/bin/python /opt/subs-bot/bot.py
 Restart=always
 RestartSec=3
-User=root
+User=subs-bot
+Group=subs-bot
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/subs-bot/data
 
 [Install]
 WantedBy=multi-user.target
