@@ -111,9 +111,12 @@ def _wrap_base64(text: str) -> str:
 class FakeContent:
     def __init__(self, body: bytes):
         self.body = body
+        self.offset = 0
 
     async def read(self, limit: int) -> bytes:
-        return self.body[:limit]
+        chunk = self.body[self.offset:self.offset + limit]
+        self.offset += len(chunk)
+        return chunk
 
 
 class FakeResponse:

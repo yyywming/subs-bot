@@ -608,7 +608,14 @@ async def fetch_subscription(url: str, timeout: int = 25) -> tuple[list[dict[str
                     continue
                 if resp.status >= 400:
                     return [], meta, f"HTTP {resp.status}"
-                body = await resp.content.read(MAX_SUBSCRIPTION_BYTES + 1)
+                body = bytearray()
+                while len(body) <= MAX_SUBSCRIPTION_BYTES:
+                    chunk = await resp.content.read(
+                        min(64 * 1024, MAX_SUBSCRIPTION_BYTES + 1 - len(body))
+                    )
+                    if not chunk:
+                        break
+                    body.extend(chunk)
                 if len(body) > MAX_SUBSCRIPTION_BYTES:
                     return [], meta, "订阅响应过大"
                 text = decode_subscription_bytes(body, resp.charset)

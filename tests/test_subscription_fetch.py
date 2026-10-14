@@ -4,10 +4,12 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from aiohttp import StreamReader
 
 from convert import MAX_SUBSCRIPTION_BYTES, fetch_subscription  # noqa: E402
 
@@ -15,9 +17,12 @@ from convert import MAX_SUBSCRIPTION_BYTES, fetch_subscription  # noqa: E402
 class FakeContent:
     def __init__(self, body: bytes):
         self.body = body
+        self.offset = 0
 
     async def read(self, limit: int) -> bytes:
-        return self.body[:limit]
+        chunk = self.body[self.offset:self.offset + limit]
+        self.offset += len(chunk)
+        return chunk
 
 
 class FakeResponse:
@@ -75,14 +80,48 @@ async def test_response_size_is_capped():
     assert error == "订阅响应过大"
 
 
-async def test_small_response_is_parsed():
-    session = FakeSession([FakeResponse(200, body=b"subscription")])
-    with patch("convert.get_session", new=AsyncMock(return_value=session)):
-        with patch("convert._check_public_url", new=AsyncMock()):
-            with patch("convert.parse_nodes_from_text", return_value=[{"name": "n"}]):
-                nodes, _meta, error = await fetch_subscription("https://public.example/sub")
-    assert nodes == [{"name": "n"}]
+async def test_fragmented_response_is_read_to_eof():
+    body = (
+        b'proxies:\n  - name: streamed\n    type: ss\n'
+        b'    server: example.com\n    port: 443\n'
+        b'    cipher: aes-256-gcm\n    password: secret\n'
+    )
+    protocol = Mock(_reading_paused=False)
+    reader = StreamReader(protocol, limit=2**16)
+    reader.feed_data(body[:18])
+    response = FakeResponse(200)
+    response.content = reader
+    session = FakeSession([response])
+
+    async def finish_body():
+        await asyncio.sleep(0)
+        reader.feed_data(body[18:])
+        reader.feed_eof()
+
+    producer = asyncio.create_task(finish_body())
+    try:
+        with patch("convert.get_session", new=AsyncMock(return_value=session)), patch(
+            "convert._check_public_url", new=AsyncMock()
+        ):
+            nodes, _meta, error = await fetch_subscription("https://public.example/sub")
+    finally:
+        await producer
     assert error is None
+    assert nodes == [{
+        "name": "streamed", "type": "ss", "server": "example.com",
+        "port": 443, "cipher": "aes-256-gcm", "password": "secret", "share": "",
+    }]
+
+
+async def test_response_exactly_at_limit_is_accepted():
+    body = b"#" + b" " * (MAX_SUBSCRIPTION_BYTES - 1)
+    session = FakeSession([FakeResponse(200, body=body)])
+    with patch("convert.get_session", new=AsyncMock(return_value=session)), patch(
+        "convert._check_public_url", new=AsyncMock()
+    ):
+        nodes, _meta, error = await fetch_subscription("https://public.example/sub")
+    assert error is None
+    assert nodes == []
 
 
 if __name__ == "__main__":
