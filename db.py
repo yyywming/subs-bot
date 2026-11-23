@@ -400,6 +400,27 @@ class Store:
             await db.commit()
         return await (self.get_sub_meta if return_meta else self.get_sub)(user_id, sub_id)
 
+    async def rotate_sub_token(self, user_id: int, sub_id: int) -> dict[str, Any] | None:
+        """重置单条订阅的专属 token，并同时吊销指向旧 token 的本地短链。"""
+        sub = await self.get_sub_meta(user_id, sub_id)
+        if not sub:
+            return None
+        old_token = str(sub.get("token") or "")
+        new_token = secrets.token_urlsafe(12)
+        now = int(time.time())
+        async with self.connection() as db:
+            await db.execute(
+                "UPDATE subscriptions SET token=?, updated_at=? WHERE user_id=? AND id=?",
+                (new_token, now, user_id, sub_id),
+            )
+            if old_token:
+                await db.execute(
+                    "DELETE FROM short_links WHERE user_id=? AND target_url LIKE ?",
+                    (user_id, f"%/sub/{old_token}%"),
+                )
+            await db.commit()
+        return await self.get_sub(user_id, sub_id)
+
     async def delete_sub(self, user_id: int, sub_id: int) -> bool:
         """软删除：整行搬进 deleted_subs。
 
@@ -454,7 +475,12 @@ class Store:
                 (user_id,name,url,token,expire_at,traffic_used,traffic_total,
                  nodes_json,node_count,last_error,created_at,updated_at)
                 SELECT user_id,name,url,
-                       COALESCE(NULLIF(token,''), ?),
+                       CASE
+                           WHEN token IS NULL OR token = ''
+                                OR EXISTS(SELECT 1 FROM subscriptions s WHERE s.token = deleted_subs.token)
+                           THEN ?
+                           ELSE token
+                       END,
                        expire_at,traffic_used,traffic_total,
                        nodes_json,node_count,last_error,created_at,?
                 FROM deleted_subs WHERE user_id=? AND id=?""",
@@ -468,6 +494,23 @@ class Store:
             await db.execute("DELETE FROM deleted_subs WHERE id=?", (deleted_id,))
             await db.commit()
         return await self.get_sub_meta(user_id, new_id)
+
+    async def restore_all_deleted(self, user_id: int, days: int = 30) -> int:
+        """批量恢复回收站中有效期内（默认 30 天）的全部订阅。"""
+        rows = await self.list_deleted(user_id, days=days)
+        restored_count = 0
+        for row in rows:
+            res = await self.restore_deleted(user_id, int(row["id"]))
+            if res is not None:
+                restored_count += 1
+        return restored_count
+
+    async def clear_deleted(self, user_id: int) -> int:
+        """清空当前用户的回收站。"""
+        async with self.connection() as db:
+            cur = await db.execute("DELETE FROM deleted_subs WHERE user_id=?", (user_id,))
+            await db.commit()
+            return max(0, int(cur.rowcount or 0))
 
     async def renumber(self, user_id: int) -> int:
         # Display numbers are derived from ORDER BY id; never rewrite rows here.
@@ -546,6 +589,14 @@ class Store:
                 (user_id, url, name, int(time.time())),
             )
             await db.commit()
+
+    async def delete_temp(self, user_id: int, temp_id: int) -> bool:
+        async with self.connection() as db:
+            cur = await db.execute(
+                "DELETE FROM temp_nodes WHERE user_id=? AND id=?", (user_id, temp_id)
+            )
+            await db.commit()
+            return cur.rowcount > 0
 
     async def clear_temp(self, user_id: int) -> int:
         async with self.connection() as db:

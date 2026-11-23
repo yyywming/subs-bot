@@ -282,6 +282,113 @@ proxies:
         self.assertEqual(alerts_second, [])
         self.assertEqual(fake_bot.send_message.await_count, 1)
 
+    async def test_ui_enhancements_temp_tosub_recycle_batch_editurl_and_retoken(self) -> None:
+        # 1. 临时节点单删与一键转正式订阅
+        await B.store.add_temp(1, "vless://11111111-1111-1111-1111-111111111111@a.example.com:443#NodeA", "NodeA")
+        await B.store.add_temp(1, "trojan://pass@b.example.com:443#NodeB", "NodeB")
+        temps = await B.store.list_temp(1)
+        self.assertEqual(len(temps), 2)
+
+        # 单删第一条临时节点
+        edits: list[tuple[str, dict]] = []
+        msg = NS(
+            text="",
+            edit_text=AsyncMock(side_effect=lambda t, **kw: edits.append((t, kw))),
+            reply_text=AsyncMock(),
+            reply_html=AsyncMock(),
+        )
+        ctx = NS(user_data={}, args=[], bot=NS(send_message=AsyncMock()))
+
+        async def _fire_cb(data_str: str) -> None:
+            q = NS(
+                data=data_str,
+                message=msg,
+                answer=AsyncMock(),
+                edit_message_text=AsyncMock(side_effect=lambda t, **kw: edits.append((t, kw))),
+            )
+            upd = NS(
+                effective_user=NS(id=1),
+                effective_chat=NS(id=1, type="private"),
+                effective_message=msg,
+                callback_query=q,
+            )
+            await B.on_callback(upd, ctx)
+
+        with patch.object(B, "allowed", AsyncMock(return_value=True)):
+            await _fire_cb(f"temp:del:{int(temps[0]['id'])}")
+            self.assertEqual(len(await B.store.list_temp(1)), 1)
+            self.assertIn("已删除该临时节点", edits[-1][0])
+
+            # 将剩余临时节点转为正式订阅
+            await _fire_cb("temp:tosub")
+            self.assertEqual(await B.store.list_temp(1), [])
+            subs = await B.store.list_subs(1)
+            self.assertEqual(len(subs), 1)
+            self.assertIn("临时节点合集", subs[0]["name"])
+            self.assertIn("协议分布: TROJAN×1", edits[-1][0])
+
+            sub_id = int(subs[0]["id"])
+            old_token = subs[0]["token"]
+            old_short = await B.store.create_short(1, B.sub_token_url(old_token, "clash"))
+            self.assertIsNotNone(await B.store.get_short(old_short))
+
+            # 2. 订阅更换链接（保持原 ID 与 Token 不变）
+            await _fire_cb(f"sub:editurl:{sub_id}:0")
+            self.assertEqual(B.interaction_data(NS(effective_chat=NS(id=1)), ctx).get("await"), "sub_editurl")
+
+            replies: list[tuple[str, dict]] = []
+            text_msg = NS(
+                text="https://new-airport.example.com/sub",
+                reply_to_message=None,
+                reply_text=AsyncMock(side_effect=lambda t, **kw: replies.append((t, kw))),
+                reply_html=AsyncMock(side_effect=lambda t, **kw: replies.append((t, kw))),
+            )
+            text_upd = NS(
+                effective_user=NS(id=1),
+                effective_chat=NS(id=1, type="private"),
+                effective_message=text_msg,
+                callback_query=None,
+            )
+            with patch.object(
+                B,
+                "fetch_subscription",
+                AsyncMock(
+                    return_value=(
+                        [{"name": "NewNode", "type": "ss", "server": "9.9.9.9", "port": 8388, "cipher": "aes-256-gcm", "password": "p"}],
+                        {"traffic_used": 1.0, "traffic_total": 50.0, "expire_at": None, "profile_name": None},
+                        None,
+                    )
+                ),
+            ):
+                await B.handle_text(text_upd, ctx)
+            updated_sub = await B.store.get_sub(1, sub_id)
+            self.assertEqual(updated_sub["url"], "https://new-airport.example.com/sub")
+            self.assertEqual(updated_sub["token"], old_token)
+            self.assertIn("订阅链接已更换并完成刷新", replies[-1][0])
+
+            # 3. 重置专属 Token（自动吊销指向旧 Token 的短链）
+            await _fire_cb(f"sub:retoken:{sub_id}:0")
+            rotated_sub = await B.store.get_sub(1, sub_id)
+            self.assertNotEqual(rotated_sub["token"], old_token)
+            self.assertIsNone(await B.store.get_short(old_short))
+
+            # 4. 回收站批量恢复与清空
+            s_extra = await B.store.add_sub(1, "ToRecycle", "https://example.com/r")
+            await B.store.delete_sub(1, sub_id)
+            await B.store.delete_sub(1, int(s_extra["id"]))
+            self.assertEqual(await B.store.count_subs(1), 0)
+            self.assertEqual(len(await B.store.list_deleted(1)), 2)
+
+            await _fire_cb("recycle:restoreall")
+            self.assertEqual(await B.store.count_subs(1), 2)
+            self.assertEqual(len(await B.store.list_deleted(1)), 0)
+
+            for s in await B.store.list_subs_meta(1):
+                await B.store.delete_sub(1, int(s["id"]))
+            self.assertEqual(len(await B.store.list_deleted(1)), 2)
+            await _fire_cb("recycle:clear")
+            self.assertEqual(len(await B.store.list_deleted(1)), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

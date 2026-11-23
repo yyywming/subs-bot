@@ -14,6 +14,7 @@ from urllib.parse import quote, quote_plus, urlparse
 import aiohttp
 from aiohttp import web
 from telegram import (
+    BotCommand,
     CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -119,7 +120,7 @@ MAIN_KB = ReplyKeyboardMarkup(
     [
         ["📦 订阅列表", "🟠 临期列表"],
         ["📤 导出链接", "🔄 更新所有"],
-        ["🔢 重置编号", "♻️ 撤销删除"],
+        ["🔢 重置编号", "♻️ 撤销删除", "🧪 临时节点"],
         ["🧭 路径对应", "❓ 帮助菜单"],
     ],
     resize_keyboard=True,
@@ -465,6 +466,38 @@ def sub_summary_line(idx: int, sub: dict[str, Any]) -> str:
     )
 
 
+def _sub_status_badge(sub: dict[str, Any], remain_traffic: float | None) -> str:
+    now = int(time.time())
+    exp = sub.get("expire_at")
+    url = str(sub.get("url") or "")
+    if sub.get("last_error"):
+        return "⚠️ 刷新异常"
+    if url.startswith("uploaded://"):
+        return "📄 本地导入配置"
+    if exp is not None and 0 < int(exp) < now:
+        return "🔴 已过期"
+    if remain_traffic is not None and remain_traffic <= 0.001:
+        return "🔴 流量耗尽"
+    if exp is not None and 0 <= int(exp) - now <= 14 * 86400:
+        return "🟠 即将到期"
+    return "🟢 状态正常"
+
+
+def _protocol_summary(nodes: list[dict[str, Any]]) -> str:
+    if not nodes:
+        return "无"
+    counts: dict[str, int] = {}
+    for n in nodes:
+        t = str(n.get("type") or "unknown").upper()
+        if t == "SHADOWSOCKS":
+            t = "SS"
+        elif t == "HY2":
+            t = "HYSTERIA2"
+        counts[t] = counts.get(t, 0) + 1
+    parts = [f"{k}×{v}" for k, v in sorted(counts.items(), key=lambda x: (-x[1], x[0]))]
+    return " · ".join(parts)
+
+
 def detail_text(sub: dict[str, Any], idx: int) -> str:
     nodes = nodes_of(sub)
     used = sub.get("traffic_used")
@@ -472,6 +505,11 @@ def detail_text(sub: dict[str, Any], idx: int) -> str:
     remain_traffic = None
     if used is not None and total is not None:
         remain_traffic = max(total - used, 0)
+
+    status_badge = _sub_status_badge(sub, remain_traffic)
+    proto_line = _protocol_summary(nodes)
+    updated_ts = sub.get("updated_at")
+    updated_str = format_expire(int(updated_ts)) if updated_ts else "未知"
 
     # 采用可展开的引用块 (expandable blockquote)，直接展示全量节点，客户端可原生点击下拉展开
     # 为防极端大库（例如上千节点）撑爆 Telegram 单消息 4096 字符硬限制，安全展示前 60 个
@@ -490,13 +528,15 @@ def detail_text(sub: dict[str, Any], idx: int) -> str:
     err = sub.get("last_error")
     err_line = f"\n⚠️ 刷新错误: {html.escape(err)}" if err else ""
     return (
-        f"配置名称: {html.escape(sub['name'])}\n"
-        f"订阅链接: {html.escape(sub['url'])}\n"
+        f"配置名称: <b>{html.escape(sub['name'])}</b>  ({status_badge})\n"
+        f"订阅链接: <code>{html.escape(sub['url'])}</code>\n"
         f"流量详情: {html.escape(format_bytes_gb(used))} / {html.escape(format_bytes_gb(total))}\n"
         f"使用进度: {html.escape(progress_bar(used, total))}\n"
         f"剩余可用: {html.escape(format_bytes_gb(remain_traffic))}\n"
         f"过期时间: {html.escape(format_expire(sub.get('expire_at')))}\n"
         f"剩余时间: {html.escape(remain_text(sub.get('expire_at')))}\n"
+        f"协议分布: {html.escape(proto_line)}\n"
+        f"更新时间: {html.escape(updated_str)}\n"
         f"📡 节点列表 ({len(nodes)} 个，支持下拉展开):\n<blockquote expandable>{node_preview}</blockquote>"
         f"{err_line}"
     )
@@ -507,19 +547,21 @@ def detail_keyboard(sub_id: int, page: int = 0, node_count: int = 0) -> InlineKe
         [
             InlineKeyboardButton("Clash Meta", callback_data=f"sub:fmt:{sub_id}:clash"),
             InlineKeyboardButton("Sing-box", callback_data=f"sub:fmt:{sub_id}:singbox"),
+            InlineKeyboardButton("Base64", callback_data=f"sub:fmt:{sub_id}:base64"),
         ],
         [
-            InlineKeyboardButton("Base64", callback_data=f"sub:fmt:{sub_id}:base64"),
             InlineKeyboardButton("Surge", callback_data=f"sub:fmt:{sub_id}:surge"),
+            InlineKeyboardButton("QX", callback_data=f"sub:fmt:{sub_id}:qx"),
+            InlineKeyboardButton("🔗 生成短链", callback_data=f"sub:short:{sub_id}"),
         ],
-        [InlineKeyboardButton("QX", callback_data=f"sub:fmt:{sub_id}:qx")],
         [
             InlineKeyboardButton("🔄 刷新订阅", callback_data=f"sub:refresh:{sub_id}:{page}"),
             InlineKeyboardButton("✏️ 重命名", callback_data=f"sub:rename:{sub_id}:{page}"),
+            InlineKeyboardButton("🔗 更换链接", callback_data=f"sub:editurl:{sub_id}:{page}"),
         ],
         [
             InlineKeyboardButton("📦 导出节点", callback_data=f"sub:nodes:{sub_id}"),
-            InlineKeyboardButton("🔗 生成短链", callback_data=f"sub:short:{sub_id}"),
+            InlineKeyboardButton("🔑 重置Token", callback_data=f"sub:retoken:{sub_id}:{page}"),
         ],
     ]
     if node_count > 0:
@@ -562,7 +604,12 @@ def list_keyboard(
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️", callback_data=f"list:page:{page-1}"))
-    nav.append(InlineKeyboardButton(f"📄 {page+1}/{pages}", callback_data="noop"))
+    nav.append(
+        InlineKeyboardButton(
+            f"📄 {page+1}/{pages}",
+            callback_data="list:jump" if pages > 1 else "noop",
+        )
+    )
     if page + 1 < pages:
         nav.append(InlineKeyboardButton("➡️", callback_data=f"list:page:{page+1}"))
     rows.append(nav)
@@ -653,7 +700,20 @@ async def render_list(user_id: int, page: int = 0, sort_mode: str = "默认") ->
     start = page * page_size
     chunk = subs[start : start + page_size]
     items = [(start + i, sub) for i, sub in enumerate(chunk, start=1)]
-    text = f"📁 <b>订阅列表 共{len(subs)}个 | 🟠{soon_count}个临期 | 第{page + 1}/{total_pages}页</b>"
+    total_nodes = sum(int(s.get("node_count") or 0) for s in subs)
+    bad_count = sum(
+        1 for s in subs
+        if s.get("last_error")
+        or (s.get("expire_at") and 0 < int(s["expire_at"]) < now)
+        or (remain_traffic_gb(s) is not None and (remain_traffic_gb(s) or 0) <= 0.001)
+    )
+    summary_parts = [f"📊 总节点: <b>{total_nodes}</b>", f"排序: <b>{html.escape(sort_mode)}</b>"]
+    if bad_count > 0:
+        summary_parts.append(f"🔴异常/耗尽: <b>{bad_count}</b>")
+    text = (
+        f"📁 <b>订阅列表 共{len(subs)}个 | 🟠{soon_count}个临期 | 第{page + 1}/{total_pages}页</b>\n"
+        f"<i>{' ｜ '.join(summary_parts)}</i>"
+    )
     return text, list_keyboard(page, len(subs), page_size, items, sort_mode=sort_mode)
 
 
@@ -768,6 +828,7 @@ async def cmd_expire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             continue
         if 0 <= exp - now <= 14 * 86400:
             soon.append((i, sub))
+    soon.sort(key=lambda pair: int(pair[1].get("expire_at") or 0))
     if not soon:
         nav = [[
             InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
@@ -778,7 +839,11 @@ async def cmd_expire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             reply_markup=InlineKeyboardMarkup(nav),
         )
         return
-    text = f"🟠 <b>临期列表 共{len(soon)}个 | 第1/1页</b>"
+    summary_lines = [sub_summary_line(idx, s) for idx, s in soon[:8]]
+    text = (
+        f"🟠 <b>临期列表 共{len(soon)}个 | 第1/1页</b>\n\n"
+        + "\n\n".join(summary_lines)
+    )
     kb = list_keyboard(0, len(soon), 8, soon)
     await update.effective_message.reply_html(text, reply_markup=kb)
 
@@ -927,35 +992,86 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await context.bot.send_message(chat_id=deliver_to, text=text_list, reply_markup=kb_list, parse_mode=ParseMode.HTML)
 
 
-async def cmd_recycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await deny(update):
-        return
-    rows = await store.list_deleted(scope_owner(update), days=30)
-    nav = [[
+async def render_recycle_page(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    rows = await store.list_deleted(user_id, days=30)
+    nav_empty = [[
         InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
         InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
     ]]
     if not rows:
-        await update.effective_message.reply_text(
-            "♻️ 订阅回收站为空，最近30天内没有可恢复的订阅。",
-            reply_markup=InlineKeyboardMarkup(nav),
+        return "♻️ 订阅回收站为空，最近30天内没有可恢复的订阅。", InlineKeyboardMarkup(nav_empty)
+
+    page_size = 8
+    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    chunk = rows[start : start + page_size]
+
+    lines = [f"♻️ <b>订阅回收站</b>（共 {len(rows)} 条 ｜ 第 {page + 1}/{total_pages} 页）\n"]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    now = int(time.time())
+    for i, row in enumerate(chunk, start=start + 1):
+        nc = int(row.get("node_count") or 0)
+        del_ts = int(row.get("deleted_at") or now)
+        left_days = max(1, 30 - max(0, (now - del_ts) // 86400))
+        lines.append(
+            f"#{i} <b>{html.escape(row['name'])}</b> · <code>{nc} 节点</code> · <i>剩 {left_days} 天</i>"
         )
-        return
-    lines = [f"♻️ <b>订阅回收站</b>（{len(rows)}）\n"]
-    keyboard = []
-    for i, row in enumerate(rows[:12], start=1):
-        lines.append(f"#{i} {html.escape(row['name'])}")
         keyboard.append([
             InlineKeyboardButton(
-                f"恢复 #{i} {row['name']}"[:64],
+                f"↩️ 恢复 #{i} {row['name']} ({nc}节点)"[:64],
                 callback_data=f"recycle:restore:{int(row['id'])}",
             )
         ])
-    keyboard.append([InlineKeyboardButton("🏠 主菜单", callback_data="list:home")])
-    await update.effective_message.reply_html(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+
+    if total_pages > 1:
+        nav_row: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("⬅️ 上页", callback_data=f"recycle:page:{page - 1}"))
+        nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+        if page + 1 < total_pages:
+            nav_row.append(InlineKeyboardButton("下页 ➡️", callback_data=f"recycle:page:{page + 1}"))
+        keyboard.append(nav_row)
+
+    keyboard.append([
+        InlineKeyboardButton("♻️ 全部恢复", callback_data="recycle:restoreall"),
+        InlineKeyboardButton("🧹 清空回收站", callback_data="recycle:clear"),
+    ])
+    keyboard.append([
+        InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+        InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
+async def cmd_recycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await deny(update):
+        return
+    text, kb = await render_recycle_page(scope_owner(update), 0)
+    await update.effective_message.reply_html(text, reply_markup=kb)
+
+
+def _export_copy_keyboard(code: str) -> InlineKeyboardMarkup:
+    clash_url = f"{PUBLIC_BASE_URL}/agg/{code}/clash"
+    singbox_url = f"{PUBLIC_BASE_URL}/agg/{code}/singbox"
+    base64_url = f"{PUBLIC_BASE_URL}/agg/{code}/base64"
+    surge_url = f"{PUBLIC_BASE_URL}/agg/{code}/surge"
+    qx_url = f"{PUBLIC_BASE_URL}/agg/{code}/qx"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 复制 Clash", copy_text=CopyTextButton(text=clash_url)),
+            InlineKeyboardButton("📋 复制 Sing-box", copy_text=CopyTextButton(text=singbox_url)),
+        ],
+        [
+            InlineKeyboardButton("📋 复制 Base64", copy_text=CopyTextButton(text=base64_url)),
+            InlineKeyboardButton("📋 复制 Surge", copy_text=CopyTextButton(text=surge_url)),
+            InlineKeyboardButton("📋 复制 QX", copy_text=CopyTextButton(text=qx_url)),
+        ],
+        [
+            InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+            InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+        ],
+    ])
 
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -977,14 +1093,15 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     surge_url = f"{PUBLIC_BASE_URL}/agg/{code}/surge"
     qx_url = f"{PUBLIC_BASE_URL}/agg/{code}/qx"
     await update.effective_message.reply_html(
-        f"📦 <b>导出完成</b>\n节点数: {len(all_nodes)}（已自动去重）\n\n"
+        f"📦 <b>导出完成</b>\n"
+        f"节点数: <b>{len(all_nodes)}</b>（已自动去重）｜ 协议: <code>{html.escape(_protocol_summary(all_nodes))}</code>\n\n"
         f"Clash Meta:\n<code>{html.escape(clash_url)}</code>\n"
         f"Sing-box:\n<code>{html.escape(singbox_url)}</code>\n"
         f"Base64:\n<code>{html.escape(base64_url)}</code>\n"
         f"Surge:\n<code>{html.escape(surge_url)}</code>\n"
         f"QX:\n<code>{html.escape(qx_url)}</code>\n\n"
         f"短链码: <code>{html.escape(code)}</code>",
-        reply_markup=MAIN_KB,
+        reply_markup=_export_copy_keyboard(code),
         disable_web_page_preview=True,
     )
 
@@ -1144,10 +1261,16 @@ async def cmd_search_export(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         scope_owner(update),
         "aggregate://ids/" + ",".join(str(int(hit["id"])) for hit in hits),
     )
-    await update.effective_message.reply_text(
-        f"📦 搜索导出完成：{len(hits)} 个订阅，{len(nodes)} 个节点\n"
-        f"{PUBLIC_BASE_URL}/agg/{code}/clash",
-        reply_markup=MAIN_KB,
+    clash_url = f"{PUBLIC_BASE_URL}/agg/{code}/clash"
+    singbox_url = f"{PUBLIC_BASE_URL}/agg/{code}/singbox"
+    base64_url = f"{PUBLIC_BASE_URL}/agg/{code}/base64"
+    await update.effective_message.reply_html(
+        f"📦 <b>搜索导出完成</b>：{len(hits)} 个订阅，{len(nodes)} 个节点\n\n"
+        f"Clash Meta:\n<code>{html.escape(clash_url)}</code>\n"
+        f"Sing-box:\n<code>{html.escape(singbox_url)}</code>\n"
+        f"Base64:\n<code>{html.escape(base64_url)}</code>",
+        reply_markup=_export_copy_keyboard(code),
+        disable_web_page_preview=True,
     )
 
 
@@ -1160,15 +1283,31 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text("用法：/s 关键词", reply_markup=MAIN_KB)
         return
     subs = await store.list_subs_meta(scope_owner(update))
-    hits = []
+    hits: list[str] = []
+    kb_rows: list[list[InlineKeyboardButton]] = []
     for i, sub in enumerate(subs, start=1):
         blob = f"{sub['name']} {sub['url']}".lower()
         if q.lower() in blob:
             hits.append(sub_summary_line(i, sub))
+            if len(kb_rows) < 8:
+                kb_rows.append([
+                    InlineKeyboardButton(
+                        list_button_label(i, sub),
+                        callback_data=f"sub:open:{int(sub['id'])}:0",
+                    )
+                ])
     if not hits:
         await update.effective_message.reply_text("没有匹配订阅。", reply_markup=MAIN_KB)
         return
-    await update.effective_message.reply_html("🔍 搜索结果\n\n" + "\n\n".join(hits), reply_markup=MAIN_KB)
+    kb_rows.append([
+        InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+        InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+    ])
+    await update.effective_message.reply_html(
+        f"🔍 <b>搜索结果</b>（共 {len(hits)} 条）\n\n" + "\n\n".join(hits[:15]),
+        reply_markup=InlineKeyboardMarkup(kb_rows),
+        disable_web_page_preview=True,
+    )
 
 
 async def cmd_github_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1302,6 +1441,49 @@ async def cmd_github_search(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 
+async def render_temp_page(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    rows = await store.list_temp(user_id)
+    if not rows:
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+                InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+            ]
+        ])
+        return "🧪 <b>临时列表为空</b>\n\n直接发送 ss/vmess/vless/trojan/hy2/tuic 分享链接即可加入临时列表。", kb
+
+    lines = [f"🧪 <b>临时节点</b> ({len(rows)})\n"]
+    del_btns: list[InlineKeyboardButton] = []
+    for i, r in enumerate(rows[:20], start=1):
+        scheme = (urlparse(str(r.get("url") or "")).scheme or "node").upper()
+        lines.append(f"#{i} [{html.escape(scheme)}] <b>{html.escape(r['name'])}</b>\n<code>{html.escape(r['url'])}</code>")
+        del_btns.append(
+            InlineKeyboardButton(
+                f"🗑 #{i} {r['name']}"[:32],
+                callback_data=f"temp:del:{int(r['id'])}",
+            )
+        )
+    if len(rows) > 20:
+        lines.append(f"<i>（仅展示前 20 条，共 {len(rows)} 条）</i>")
+
+    kb_rows: list[list[InlineKeyboardButton]] = [
+        del_btns[idx : idx + 2] for idx in range(0, min(len(del_btns), 12), 2)
+    ]
+    all_urls = "\n".join(str(r["url"]) for r in rows[:15])
+    action_row = [
+        InlineKeyboardButton("📦 转为正式订阅", callback_data="temp:tosub"),
+        InlineKeyboardButton("🧹 清空全部", callback_data="temp:clear"),
+    ]
+    if len(all_urls) <= 256:
+        kb_rows.append([InlineKeyboardButton("📋 一键复制全部链接", copy_text=CopyTextButton(text=all_urls))])
+    kb_rows.append(action_row)
+    kb_rows.append([
+        InlineKeyboardButton("📤 聚合导出", callback_data="temp:export"),
+        InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+    ])
+    return "\n\n".join(lines), InlineKeyboardMarkup(kb_rows)
+
+
 async def cmd_temp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
@@ -1315,10 +1497,8 @@ async def cmd_temp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not rows:
         await update.effective_message.reply_text("临时列表为空。", reply_markup=MAIN_KB)
         return
-    lines = [f"🧪 临时节点 ({len(rows)})\n"]
-    for i, r in enumerate(rows, start=1):
-        lines.append(f"#{i} {html.escape(r['name'])}\n<code>{html.escape(r['url'])}</code>")
-    await update.effective_message.reply_html("\n\n".join(lines), reply_markup=MAIN_KB)
+    text, kb = await render_temp_page(user_id)
+    await update.effective_message.reply_html(text, reply_markup=kb, disable_web_page_preview=True)
 
 
 async def show_detail(update: Update, user_id: int, idx: int, page: int = 0) -> None:
@@ -1371,7 +1551,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "📦 订阅列表", "📋 订阅列表", "订阅列表", "⏳ 临期列表", "🟠 临期列表",
         "临期列表", "🔗 短链", "短链", "📦 导出", "📤 导出链接", "导出", "导出链接",
         "🔄 更新所有", "更新所有", "🔢 重置编号", "重置编号", "♻️ 撤销删除", "撤销删除",
-        "🧭 路径对应", "路径对应", "❓ 帮助菜单", "帮助菜单", "帮助",
+        "🧪 临时节点", "临时节点", "🧭 路径对应", "路径对应", "❓ 帮助菜单", "帮助菜单", "帮助",
     }
     is_group = update.effective_chat.type in {"group", "supergroup"}
     addressed = False
@@ -1415,6 +1595,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == sub_id), sub_id)
         await update.effective_message.reply_html(
             f"✅ 订阅名称已更新为：<b>{html.escape(new_name)}</b>\n\n" + detail_text(updated, idx),
+            reply_markup=detail_keyboard(sub_id, page, len(nodes_of(updated))),
+            disable_web_page_preview=True,
+        )
+        return
+
+    # ── 订阅更换链接状态机 ─────────────────────────
+    if state == "sub_editurl":
+        sub_id = scoped.pop("editurl_sub_id", None)
+        page = scoped.pop("editurl_page", 0)
+        scoped.pop("await", None)
+        new_url = text.strip()
+        if not re.match(r"^https?://\S+$", new_url):
+            await update.effective_message.reply_text("❌ 订阅链接格式无效（须为 http/https 链接），已取消更换。", reply_markup=MAIN_KB)
+            return
+        updated = await store.update_sub(user_id, sub_id, url=new_url)
+        if not updated:
+            await update.effective_message.reply_text("❌ 订阅不存在或已被删除。", reply_markup=MAIN_KB)
+            return
+        updated = await refresh_sub(user_id, updated, rename=False)
+        subs = await store.list_subs_meta(user_id)
+        idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == sub_id), sub_id)
+        await update.effective_message.reply_html(
+            f"✅ <b>订阅链接已更换并完成刷新</b>（原专属短链与 Token 保持不变）\n\n" + detail_text(updated, idx),
             reply_markup=detail_keyboard(sub_id, page, len(nodes_of(updated))),
             disable_web_page_preview=True,
         )
@@ -1530,6 +1733,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return await cmd_renumber(update, context)
     if text in ("♻️ 撤销删除", "撤销删除"):
         return await cmd_recycle(update, context)
+    if text in ("🧪 临时节点", "临时节点"):
+        return await cmd_temp(update, context)
     if text in ("🧭 路径对应", "路径对应"):
         return await cmd_path(update, context)
     if text in ("❓ 帮助菜单", "帮助菜单", "帮助"):
@@ -1544,9 +1749,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.effective_message.reply_text("短链目标必须是 http/https 链接。")
             return
         short = await make_short_url(user_id, target)
+        copy_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 一键复制短链", copy_text=CopyTextButton(text=short))]
+        ])
         await update.effective_message.reply_html(
             f"✅ 短链已生成\n<code>{html.escape(short)}</code>",
-            reply_markup=MAIN_KB,
+            reply_markup=copy_kb,
         )
         return
 
@@ -1971,13 +2179,113 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             disable_web_page_preview=True,
         )
         return
+    if data.startswith("recycle:page:"):
+        page = int(data.split(":")[-1])
+        text, kb = await render_recycle_page(user_id, page)
+        with suppress(Exception):
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+    if data == "recycle:restoreall":
+        count = await store.restore_all_deleted(user_id)
+        done_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+                InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+            ]
+        ])
+        with suppress(Exception):
+            await q.edit_message_text(
+                f"✅ 已全部恢复（共 {count} 条订阅）。" if count else "♻️ 回收站中没有可恢复的订阅。",
+                reply_markup=done_kb,
+            )
+        return
+    if data == "recycle:clear":
+        count = await store.clear_deleted(user_id)
+        done_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+                InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+            ]
+        ])
+        with suppress(Exception):
+            await q.edit_message_text(f"🧹 已清空回收站（共清理 {count} 条记录）。", reply_markup=done_kb)
+        return
     if data.startswith("recycle:restore:"):
         deleted_id = int(data.split(":")[-1])
         restored = await store.restore_deleted(user_id, deleted_id)
         if restored:
-            await q.edit_message_text(f"✅ 已恢复：{restored['name']}")
+            restored_kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("📂 打开该订阅", callback_data=f"sub:open:{int(restored['id'])}:0"),
+                    InlineKeyboardButton("♻️ 返回回收站", callback_data="recycle:page:0"),
+                ],
+                [
+                    InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+                    InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+                ],
+            ])
+            await q.edit_message_text(f"✅ 已恢复：{restored['name']}", reply_markup=restored_kb)
         else:
             await q.edit_message_text("恢复失败，记录可能已过期。")
+        return
+    if data.startswith("temp:del:"):
+        temp_id = int(data.split(":")[-1])
+        deleted = await store.delete_temp(user_id, temp_id)
+        page_text, page_kb = await render_temp_page(user_id)
+        prefix = "✅ 已删除该临时节点。\n\n" if deleted else "❌ 临时节点不存在。\n\n"
+        with suppress(Exception):
+            await q.edit_message_text(
+                prefix + page_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=page_kb,
+                disable_web_page_preview=True,
+            )
+        return
+    if data == "temp:clear":
+        n = await store.clear_temp(user_id)
+        done_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+                InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+            ]
+        ])
+        with suppress(Exception):
+            await q.edit_message_text(f"🧹 已清空临时节点 {n} 条。", reply_markup=done_kb)
+        return
+    if data == "temp:tosub":
+        rows = await store.list_temp(user_id)
+        if not rows:
+            await q.edit_message_text("临时列表为空，无法转为订阅。")
+            return
+        nodes = [_temp_row_to_node(r) for r in rows]
+        sub_name = f"临时节点合集 ({len(nodes)})"
+        sub = await store.add_imported_sub(user_id, sub_name, nodes)
+        await store.clear_temp(user_id)
+        subs = await store.list_subs_meta(user_id)
+        idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == int(sub["id"])), 1)
+        await q.edit_message_text(
+            f"✅ <b>已将 {len(nodes)} 条临时节点转为正式订阅！</b>\n\n" + detail_text(sub, idx),
+            parse_mode=ParseMode.HTML,
+            reply_markup=detail_keyboard(int(sub["id"]), 0, len(nodes)),
+            disable_web_page_preview=True,
+        )
+        return
+    if data == "temp:export":
+        all_nodes = await mapped_nodes_for_user(user_id)
+        if not all_nodes:
+            await q.edit_message_text("暂无可导出节点。")
+            return
+        code = await store.create_short(user_id, "aggregate://all")
+        clash_url = f"{PUBLIC_BASE_URL}/agg/{code}/clash"
+        base64_url = f"{PUBLIC_BASE_URL}/agg/{code}/base64"
+        await q.edit_message_text(
+            f"📦 <b>导出完成</b>\n节点数: <b>{len(all_nodes)}</b>（含临时节点，已自动去重）\n\n"
+            f"Clash Meta:\n<code>{html.escape(clash_url)}</code>\n"
+            f"Base64:\n<code>{html.escape(base64_url)}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_export_copy_keyboard(code),
+            disable_web_page_preview=True,
+        )
         return
     if data.startswith("sub:vn:"):
         parts = data.split(":")
@@ -2001,12 +2309,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         lines = [
             f"📡 <b>节点浏览：{html.escape(sub['name'])}</b>",
-            f"<i>共 {len(nodes)} 个节点 ｜ 第 {node_page + 1}/{total_pages} 页</i>\n",
+            f"<i>共 {len(nodes)} 个节点 ｜ 协议: {html.escape(_protocol_summary(nodes))} ｜ 第 {node_page + 1}/{total_pages} 页</i>\n",
         ]
+        page_links: list[str] = []
         for i, n in enumerate(chunk_nodes, start=start_idx + 1):
             n_type = html.escape(str(n.get("type") or "node")).upper()
             n_name = html.escape(str(n.get("name") or "未命名"))
-            lines.append(f"<code>#{i:02d}</code> [{n_type}] <b>{n_name}</b>")
+            server = str(n.get("server") or "")
+            port = n.get("port") or n.get("server_port") or ""
+            ep_str = f" <code>({html.escape(server)}:{html.escape(str(port))})</code>" if server and port else ""
+            lines.append(f"<code>#{i:02d}</code> [{n_type}] <b>{n_name}</b>{ep_str}")
+            link = node_to_share_link(n)
+            if link:
+                page_links.append(link)
+
+        if page_links:
+            preview_links = "\n".join(html.escape(l) for l in page_links[:8])
+            lines.append(f"\n🔗 <b>本页分享链接（轻触展开复制）：</b>\n<blockquote expandable><code>{preview_links}</code></blockquote>")
 
         nav_row: list[InlineKeyboardButton] = []
         if node_page > 0:
@@ -2019,7 +2338,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if total_pages > 1:
             kb_rows.append(nav_row)
         kb_rows.append([
-            InlineKeyboardButton("⬅️ 返回订阅详情", callback_data=f"sub:open:{sub_id}:{list_page}")
+            InlineKeyboardButton("📦 导出全部节点文件", callback_data=f"sub:nodes:{sub_id}"),
+            InlineKeyboardButton("⬅️ 返回订阅详情", callback_data=f"sub:open:{sub_id}:{list_page}"),
         ])
 
         await q.edit_message_text(
@@ -2054,8 +2374,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "surge": "Surge",
             "qx": "QX",
         }.get(kind, kind)
+        copy_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"📋 一键复制 {title} 链接", copy_text=CopyTextButton(text=short))]
+        ])
         await q.message.reply_html(
-            f"🔗 <b>{html.escape(title)}</b>\n<code>{html.escape(short)}</code>",
+            f"🔗 <b>{html.escape(title)}</b>（{html.escape(sub['name'])}）\n<code>{html.escape(short)}</code>",
+            reply_markup=copy_kb,
             disable_web_page_preview=True,
         )
         return
@@ -2096,6 +2420,45 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             reply_markup=MAIN_KB,
         )
         return
+    if data.startswith("sub:editurl:"):
+        parts = data.split(":")
+        sub_id = int(parts[2])
+        page = int(parts[3]) if len(parts) > 3 else 0
+        sub = await store.get_sub(user_id, sub_id)
+        if not sub:
+            await q.edit_message_text("订阅不存在")
+            return
+        scoped = interaction_data(update, context)
+        scoped["await"] = "sub_editurl"
+        scoped["editurl_sub_id"] = sub_id
+        scoped["editurl_page"] = page
+        await q.message.reply_text(
+            f"🔗 请发送订阅「<b>{html.escape(sub['name'])}</b>」的新订阅链接（http/https）：\n"
+            "<i>（将保留该订阅的本地专属短链与 Token 不变，输入 取消 可退出）</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=MAIN_KB,
+        )
+        return
+    if data.startswith("sub:retoken:"):
+        parts = data.split(":")
+        sub_id = int(parts[2])
+        page = int(parts[3]) if len(parts) > 3 else 0
+        updated = await store.rotate_sub_token(user_id, sub_id)
+        if not updated:
+            await q.edit_message_text("订阅不存在")
+            return
+        subs = await store.list_subs_meta(user_id)
+        idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == sub_id), sub_id)
+        new_clash = sub_token_url(updated["token"], "clash")
+        await q.edit_message_text(
+            f"🔑 <b>已重置专属 Token（旧短链已自动吊销）</b>\n"
+            f"新 Clash 订阅地址：<code>{html.escape(new_clash)}</code>\n\n"
+            + detail_text(updated, idx),
+            parse_mode=ParseMode.HTML,
+            reply_markup=detail_keyboard(sub_id, page, len(nodes_of(updated))),
+            disable_web_page_preview=True,
+        )
+        return
     if data.startswith("sub:delask:"):
         parts = data.split(":")
         sub_id = int(parts[2])
@@ -2132,13 +2495,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         target = sub_token_url(sub["token"], "clash")
         short = await make_short_url(user_id, target)
+        short_rows = [[InlineKeyboardButton("📋 一键复制短链", copy_text=CopyTextButton(text=short))]]
+        if str(sub.get("url") or "").startswith(("http://", "https://")) and len(str(sub["url"])) <= 256:
+            short_rows.append([InlineKeyboardButton("📋 复制原始订阅链接", copy_text=CopyTextButton(text=str(sub["url"])))])
         await q.message.reply_html(
             "🔗 <b>短链生成成功</b>\n"
             f"🏷️ 原始机场名称：{html.escape(sub['name'])}\n"
-            f"🌐 原始订阅链接：{html.escape(sub['url'])}\n"
-            f"🌟 生成短链地址：{html.escape(short)}\n"
+            f"🌐 原始订阅链接：<code>{html.escape(sub['url'])}</code>\n"
+            f"🌟 生成短链地址：<code>{html.escape(short)}</code>\n"
             "📦 此短链会代理原始订阅，可直接导入客户端\n"
             "⚠️ 注意部分机场无法代理访问，请先自行尝试",
+            reply_markup=InlineKeyboardMarkup(short_rows),
             disable_web_page_preview=True,
         )
         return
@@ -2723,14 +3090,29 @@ async def amain() -> None:
         await app.initialize()
         await app.start()
 
-        # 启动后从官方自动校准真实 Bot Username，彻底杜绝跳错频道
+        # 启动后从官方自动校准真实 Bot Username，并注册原生命令菜单
         try:
             me = await app.bot.get_me()
             if me and me.username:
                 get_bot_username(me)
                 log.info("Bot username calibrated: @%s", CURRENT_BOT_USERNAME)
+            await app.bot.set_my_commands([
+                BotCommand("list", "📦 查看订阅列表"),
+                BotCommand("expire", "🟠 查看临期订阅"),
+                BotCommand("export", "📤 聚合导出全部节点"),
+                BotCommand("temp", "🧪 管理临时节点"),
+                BotCommand("path", "🧭 节点路径名称映射"),
+                BotCommand("s", "🔍 搜索订阅 (/s 关键词)"),
+                BotCommand("o", "📦 导出搜索结果 (/o 关键词)"),
+                BotCommand("d", "🗑 批量删除匹配订阅 (/d 关键词)"),
+                BotCommand("i", "🔀 切换排序方式 (默认/流量/到期/名称)"),
+                BotCommand("g", "🔎 搜索 GitHub 开源仓库与代码"),
+                BotCommand("ai", "🤖 批量测试 OpenAI 兼容 API"),
+                BotCommand("auth", "🔐 授权管理 (仅管理员私聊)"),
+                BotCommand("help", "❓ 查看帮助菜单"),
+            ])
         except Exception as e:
-            log.warning("Failed to calibrate bot username from API: %s", e)
+            log.warning("Failed to calibrate bot username or commands from API: %s", e)
 
         await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
         maint_task = asyncio.create_task(_maintenance_loop(app.bot))
