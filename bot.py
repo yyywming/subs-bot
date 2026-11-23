@@ -3572,6 +3572,25 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.effective_message.reply_text("⚠️ 处理出错，请稍后重试。")
 
 
+BOT_COMMANDS: list[BotCommand] = [
+    BotCommand("start", "🏠 打开主菜单"),
+    BotCommand("list", "📦 查看订阅列表"),
+    BotCommand("expire", "🟠 查看临期订阅"),
+    BotCommand("export", "📤 聚合导出全部节点"),
+    BotCommand("temp", "🧪 管理临时节点"),
+    BotCommand("recycle", "♻️ 查看回收站"),
+    BotCommand("path", "🧭 节点路径名称映射"),
+    BotCommand("s", "🔍 搜索订阅 (/s 关键词)"),
+    BotCommand("o", "📦 导出搜索结果 (/o 关键词)"),
+    BotCommand("d", "🗑 批量删除匹配订阅 (/d 关键词)"),
+    BotCommand("i", "🔀 切换排序方式 (默认/流量/到期/名称)"),
+    BotCommand("g", "🔎 搜索 GitHub 开源仓库与代码"),
+    BotCommand("ai", "🤖 批量测试 OpenAI 兼容 API"),
+    BotCommand("auth", "🔐 授权管理 (仅管理员私聊)"),
+    BotCommand("help", "❓ 查看帮助菜单"),
+]
+
+
 def build_app() -> Application:
     # 全局关掉链接预览：这个 bot 发的几乎全是订阅链接/节点列表/GitHub 链接，
     # Telegram 自动拽出来的预览卡纯属噪音。在 Defaults 里设一次，省掉逐个调用点传参
@@ -3584,6 +3603,8 @@ def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).defaults(defaults).concurrent_updates(True).build()
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_start))
+    app.add_handler(CommandHandler("recycle", cmd_recycle))
     app.add_handler(CommandHandler("auth", cmd_auth))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("list", cmd_list))
@@ -3742,21 +3763,7 @@ async def amain() -> None:
             if me and me.username:
                 get_bot_username(me)
                 log.info("Bot username calibrated: @%s", CURRENT_BOT_USERNAME)
-            await app.bot.set_my_commands([
-                BotCommand("list", "📦 查看订阅列表"),
-                BotCommand("expire", "🟠 查看临期订阅"),
-                BotCommand("export", "📤 聚合导出全部节点"),
-                BotCommand("temp", "🧪 管理临时节点"),
-                BotCommand("path", "🧭 节点路径名称映射"),
-                BotCommand("s", "🔍 搜索订阅 (/s 关键词)"),
-                BotCommand("o", "📦 导出搜索结果 (/o 关键词)"),
-                BotCommand("d", "🗑 批量删除匹配订阅 (/d 关键词)"),
-                BotCommand("i", "🔀 切换排序方式 (默认/流量/到期/名称)"),
-                BotCommand("g", "🔎 搜索 GitHub 开源仓库与代码"),
-                BotCommand("ai", "🤖 批量测试 OpenAI 兼容 API"),
-                BotCommand("auth", "🔐 授权管理 (仅管理员私聊)"),
-                BotCommand("help", "❓ 查看帮助菜单"),
-            ])
+            await app.bot.set_my_commands(BOT_COMMANDS)
         except Exception as e:
             log.warning("Failed to calibrate bot username or commands from API: %s", e)
 

@@ -374,6 +374,8 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(B.MAIN_KB, InlineKeyboardMarkup)
         self.assertEqual(len(B.HOME_INLINE_KB.inline_keyboard), 5)
         self.assertTrue(all(len(row) == 2 for row in B.HOME_INLINE_KB.inline_keyboard))
+        self.assertEqual(B.BOT_COMMANDS[0].command, "start")
+        self.assertIn("主菜单", B.BOT_COMMANDS[0].description)
 
         # 2. /start 先清理旧底部键盘并删除临时消息，再发内联两列卡片主菜单
         sent: list[tuple[str, str, dict]] = []
