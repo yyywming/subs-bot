@@ -19,6 +19,9 @@ os.environ["DATA_DIR"] = _tmp
 os.environ["DB_PATH"] = os.path.join(_tmp, "personal-scope.db")
 os.environ["BOT_USERNAME"] = "subsbot"
 os.environ["PUBLIC_BASE_URL"] = "http://127.0.0.1:8787"
+os.environ["SHORTLINK_API_URL"] = ""
+os.environ["SHORTLINK_TOKEN"] = ""
+os.environ["SHORTLINK_DOMAIN"] = ""
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
