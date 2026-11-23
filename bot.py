@@ -85,6 +85,13 @@ from convert import (
     _check_public_url,
 )
 from db import Store, nodes_of
+from apitest import (
+    MAX_API_PAIRS,
+    format_probe_result,
+    looks_like_api_test,
+    parse_api_pairs,
+    probe_api,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 # httpx/httpcore 在 INFO 级会把每次请求的完整 URL 打进日志，而 Telegram 的 URL
@@ -1362,12 +1369,69 @@ async def cmd_inline_sort(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+API_TEST_USAGE = (
+    "请发送要测试的 API 地址和 Key，支持以下写法（多组可连续发送，最多 "
+    f"{MAX_API_PAIRS} 组）：\n"
+    "• 地址 和 Key 分两行\n"
+    "• 地址 Key（同一行空格分隔）\n"
+    "• 地址|Key\n"
+    "地址可写到域名、/v1 或 /v1/chat/completions，会自动规范化。"
+)
+
+
+async def run_api_tests(
+    update: Update, pairs: list[tuple[str, str]], *, is_group: bool, stray: int = 0
+) -> None:
+    """并发检测多组「地址 + Key」，每组一条结果消息。群聊里 Key 打码，避免泄露给群成员。"""
+    message = update.effective_message
+    pairs = pairs[:MAX_API_PAIRS]
+    status_msg = await message.reply_text(f"🧪 正在测试 {len(pairs)} 组 API，请稍候…")
+    sem = asyncio.Semaphore(5)
+
+    async def _one(api_url: str, key: str) -> dict[str, Any]:
+        async with sem:
+            return await probe_api(api_url, key, get_session=get_session, check_url=_check_public_url)
+
+    results = await asyncio.gather(*(_one(u, k) for u, k in pairs))
+
+    rendered: list[tuple[str, InlineKeyboardMarkup | None]] = []
+    for res in results:
+        text = format_probe_result(res, show_full_key=not is_group)
+        rows = _copy_rows(
+            [
+                copy_button("📋 复制地址", res["base"]),
+                copy_button("📋 复制 Key", res["key"]) if not is_group else None,
+            ],
+            [copy_button("📋 复制测试模型", res["model"]) if res.get("model") else None],
+        )
+        rendered.append((text, InlineKeyboardMarkup(rows) if rows else None))
+
+    ok_count = sum(1 for r in results if r.get("ok"))
+    summary = f"🧪 测试完成：共 {len(results)} 组，✅ {ok_count} 组可用，❌ {len(results) - ok_count} 组失败"
+    if stray:
+        summary += f"\n⚠️ 另有 {stray} 段内容无法配对成「地址 + Key」，已忽略"
+
+    edit = getattr(status_msg, "edit_text", None)
+    if len(rendered) == 1 and not stray and callable(edit):
+        text, kb = rendered[0]
+        try:
+            await edit(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+            return
+        except Exception as exc:  # 编辑失败（如消息已删除）时退回新消息
+            log.warning("edit api test status failed: %s", exc)
+    elif callable(edit):
+        with suppress(Exception):
+            await edit(summary)
+    for text, kb in rendered:
+        await message.reply_html(text, reply_markup=kb, disable_web_page_preview=True)
+
+
 async def cmd_api_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
     interaction_data(update, context)["await"] = "api_test"
     await update.effective_message.reply_text(
-        "🧪 API 批量测试\n请发送要测试的 API 地址和 Key，每行一组：\n地址|Key",
+        "🧪 API 批量测试\n" + API_TEST_USAGE,
         reply_markup=MAIN_KB,
     )
 
@@ -1811,55 +1875,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # ── /ai API 测试状态机 ─────────────────────────
     if state == "api_test":
         scoped.pop("await", None)
-        results = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if "|" in line:
-                api_url, _, key = line.partition("|")
-            else:
-                parts = line.split()
-                api_url, key = (parts[0], parts[1]) if len(parts) >= 2 else ("", "")
-            api_url = api_url.strip().rstrip("/")
-            key = key.strip()
-            if not re.match(r"^https?://", api_url) or not key:
-                results.append("⚠️ 格式错误：请用 API地址|Key（每行一组）")
-                continue
-            # API 探测只允许公网 HTTP(S)，并逐跳禁止重定向，避免把服务端变成 SSRF 代理。
-            probe_url = api_url if api_url.rstrip("/").endswith(("/models", "/chat/completions")) else api_url + "/v1/models"
-            t0 = time.time()
-            try:
-                await _check_public_url(probe_url)
-                timeout = aiohttp.ClientTimeout(total=15)
-                session = await get_session()
-                async with session.get(
-                    probe_url,
-                    headers={"Authorization": f"Bearer {key}", "X-API-Key": key},
-                    timeout=timeout,
-                    allow_redirects=False,
-                ) as resp:
-                    elapsed = time.time() - t0
-                    status = resp.status
-                    # 只读前 4KB：对端返回超大响应时不能把整个 body 读进内存
-                    raw_body = await resp.content.read(4096)
-                    try:
-                        body_text = raw_body.decode(resp.charset or "utf-8", "replace")
-                    except LookupError:
-                        body_text = raw_body.decode("utf-8", "replace")
-                    body = body_text[:120].replace("\n", " ")
-                # 不回显 Key；只展示状态、延迟和有限响应摘要。
-                mark = "✅" if 200 <= status < 300 else "❌"
-                results.append(f"{mark} {api_url} → HTTP {status} ({elapsed:.1f}s) {body}")
-            except Exception as exc:
-                elapsed = time.time() - t0
-                results.append(f"❌ {api_url} → {type(exc).__name__} ({elapsed:.1f}s)")
-        if not results:
-            await update.effective_message.reply_text("未解析到任何 API 地址和 Key。", reply_markup=MAIN_KB)
+        pairs, stray = parse_api_pairs(text)
+        if not pairs:
+            await update.effective_message.reply_text(
+                "⚠️ 格式错误：未识别到「API 地址 + Key」。\n" + API_TEST_USAGE, reply_markup=MAIN_KB
+            )
             return
-        await update.effective_message.reply_text(
-            truncate_utf16("\n".join(results[:20]), TG_MESSAGE_LIMIT - 96), reply_markup=MAIN_KB
-        )
+        await run_api_tests(update, pairs, is_group=is_group, stray=stray)
         return
 
     # ── 内联排序状态机 ─────────────────────────────
@@ -1915,6 +1937,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"✅ 短链已生成\n<code>{html.escape(short)}</code>",
             reply_markup=copy_kb,
         )
+        return
+
+    # 直接发送「API 地址 + Key」：必须在「名称|链接」和订阅链接识别之前判断，
+    # 否则地址会被当成订阅链接加进列表（Key 以 == 结尾也不能落进路径规则）。
+    if (not is_group or addressed) and looks_like_api_test(text):
+        pairs, _stray = parse_api_pairs(text)
+        await run_api_tests(update, pairs, is_group=is_group)
         return
 
     if (not is_group or addressed) and "=" in text and not text.lower().startswith("http") and "://" not in text.split("=", 1)[0]:
