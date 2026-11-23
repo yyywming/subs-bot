@@ -26,6 +26,11 @@ fi
 
 cd "${INSTALL_DIR}"
 
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+    echo "ERROR: Python 3.11+ is required (found $(python3 --version 2>&1))"
+    exit 1
+fi
+
 echo ">>> creating venv..."
 python3 -m venv "${VENV_DIR}"
 "${VENV_DIR}/bin/pip" install --upgrade pip -q
@@ -82,9 +87,12 @@ systemctl enable subs-bot
 systemctl restart subs-bot
 
 echo ">>> waiting for health..."
+# 健康检查端口跟随 .env 的 HTTP_PORT，避免改了端口后部署脚本误判失败
+HTTP_PORT_VALUE="$(_env_get HTTP_PORT 2>/dev/null || true)"
+HTTP_PORT_VALUE="${HTTP_PORT_VALUE:-8787}"
 ok=0
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if curl -sf -m 3 "http://127.0.0.1:8787/health" >/dev/null; then
+for _ in $(seq 1 15); do
+    if curl -sf -m 3 "http://127.0.0.1:${HTTP_PORT_VALUE}/health" >/dev/null; then
         ok=1
         break
     fi
@@ -102,4 +110,4 @@ systemctl is-active subs-bot
 echo "=== done ==="
 echo "  service:  systemctl status subs-bot"
 echo "  logs:     journalctl -u subs-bot -f"
-echo "  health:   curl http://localhost:8787/health"
+echo "  health:   curl http://localhost:${HTTP_PORT_VALUE}/health"

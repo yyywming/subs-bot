@@ -401,22 +401,36 @@ class Store:
         return await (self.get_sub_meta if return_meta else self.get_sub)(user_id, sub_id)
 
     async def rotate_sub_token(self, user_id: int, sub_id: int) -> dict[str, Any] | None:
-        """重置单条订阅的专属 token，并同时吊销指向旧 token 的本地短链。"""
-        sub = await self.get_sub_meta(user_id, sub_id)
-        if not sub:
-            return None
-        old_token = str(sub.get("token") or "")
+        """重置单条订阅的专属 token，并同时吊销指向旧 token 的本地短链。
+
+        读旧 token、写新 token、删短链在同一把锁、同一个事务里完成：避免两次并发
+        重置时第二次读到已过期的旧 token，从而漏删第一次生成的短链。
+        短链匹配用 instr 精确比对 ``/sub/<token>/`` 或以 ``/sub/<token>`` 结尾，
+        不用 LIKE —— token_urlsafe 含 ``_``，在 LIKE 里是单字符通配符，会误删别的短链。
+        """
         new_token = secrets.token_urlsafe(12)
         now = int(time.time())
         async with self.connection() as db:
+            cur = await db.execute(
+                "SELECT token FROM subscriptions WHERE user_id=? AND id=?", (user_id, sub_id)
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            old_token = str(row["token"] or "")
             await db.execute(
                 "UPDATE subscriptions SET token=?, updated_at=? WHERE user_id=? AND id=?",
                 (new_token, now, user_id, sub_id),
             )
             if old_token:
+                needle = f"/sub/{old_token}"
                 await db.execute(
-                    "DELETE FROM short_links WHERE user_id=? AND target_url LIKE ?",
-                    (user_id, f"%/sub/{old_token}%"),
+                    """DELETE FROM short_links
+                       WHERE user_id=?
+                         AND (instr(target_url, ?) > 0
+                              OR substr(target_url, -length(?)) = ?
+                              OR instr(target_url, ?) > 0)""",
+                    (user_id, needle + "/", needle, needle, needle + "?"),
                 )
             await db.commit()
         return await self.get_sub(user_id, sub_id)

@@ -10,6 +10,12 @@ EnvironmentFile=/opt/subs-bot/.env
 ExecStart=/opt/subs-bot/.venv/bin/python /opt/subs-bot/bot.py
 Restart=always
 RestartSec=3
+# bot.py 捕获 SIGTERM 后会关闭轮询、HTTP 服务、数据库与会话；给足收尾时间
+KillSignal=SIGTERM
+TimeoutStopSec=20
+# ProtectSystem=strict 下代码目录只读，禁止写 __pycache__；日志不缓冲，journal 实时可见
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
 User=subs-bot
 Group=subs-bot
 UMask=0077

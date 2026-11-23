@@ -6,6 +6,7 @@ import html
 import json
 import logging
 import re
+import signal
 import time
 from contextlib import suppress
 from typing import Any
@@ -19,6 +20,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
+    InlineQueryResultsButton,
     InputTextMessageContent,
     LinkPreviewOptions,
     ReplyKeyboardMarkup,
@@ -114,6 +116,82 @@ def _document_suffix(filename: str) -> str:
 
 def _unique(values: list[str]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
+
+
+# Telegram 硬限制
+TG_MESSAGE_LIMIT = 4096
+TG_CALLBACK_ALERT_LIMIT = 200
+TG_COPY_TEXT_LIMIT = 256
+# 正文预算：给标题/按钮说明等固定文案留出余量
+TG_SAFE_BODY = 3800
+
+_URL_TRAILING_PUNCT = ".,;:!?)]}>\"'，。；：！？）】》」』、"
+
+
+def _utf16_len(text: str) -> int:
+    """Telegram 按 UTF-16 码元计长度；emoji 等补充平面字符算 2。"""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def truncate_utf16(text: str, limit: int, ellipsis: str = "…") -> str:
+    """按 UTF-16 长度截断，保证不切开代理对，也不超过 Telegram 的硬上限。"""
+    if _utf16_len(text) <= limit:
+        return text
+    budget = max(0, limit - _utf16_len(ellipsis))
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        w = 2 if ord(ch) > 0xFFFF else 1
+        if used + w > budget:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + ellipsis
+
+
+def copy_button(label: str, text: str) -> InlineKeyboardButton | None:
+    """生成 CopyTextButton；内容为空或超过 256 字符（Telegram 硬限制）时返回 None，由调用方跳过。"""
+    text = str(text or "")
+    if not text or _utf16_len(text) > TG_COPY_TEXT_LIMIT:
+        return None
+    return InlineKeyboardButton(label, copy_text=CopyTextButton(text=text))
+
+
+def _copy_rows(*rows: list[InlineKeyboardButton | None]) -> list[list[InlineKeyboardButton]]:
+    """过滤掉超限而返回 None 的复制按钮，并丢弃因此变空的行。"""
+    out: list[list[InlineKeyboardButton]] = []
+    for row in rows:
+        kept = [btn for btn in row if btn is not None]
+        if kept:
+            out.append(kept)
+    return out
+
+
+def is_ascii_digits(text: str) -> bool:
+    """只认 ASCII 0-9。str.isdigit() 对 '²'、'①' 也返回 True，随后 int() 会直接抛 ValueError。"""
+    return bool(text) and text.isascii() and text.isdigit()
+
+
+def clean_url_token(url: str) -> str:
+    """去掉从聊天文本里抠出来的 URL 尾随标点（含中文全角标点）。"""
+    return url.rstrip(_URL_TRAILING_PUNCT)
+
+
+def is_valid_http_url(url: str, max_len: int = 2048) -> bool:
+    """单个、无空白/控制字符的 http(s) URL。用于短链目标与更换链接。
+
+    带换行的目标存进 short_links 后，/s/ 跳转时 aiohttp 会因 Location 头含 CRLF 抛异常（500）。
+    """
+    if not url or len(url) > max_len:
+        return False
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
+        return False
+    if not re.fullmatch(r"https?://\S+", url, re.I):
+        return False
+    try:
+        return bool(urlparse(url).hostname)
+    except ValueError:
+        return False
 
 
 MAIN_KB = ReplyKeyboardMarkup(
@@ -511,25 +589,36 @@ def detail_text(sub: dict[str, Any], idx: int) -> str:
     updated_ts = sub.get("updated_at")
     updated_str = format_expire(int(updated_ts)) if updated_ts else "未知"
 
-    # 采用可展开的引用块 (expandable blockquote)，直接展示全量节点，客户端可原生点击下拉展开
-    # 为防极端大库（例如上千节点）撑爆 Telegram 单消息 4096 字符硬限制，安全展示前 60 个
+    # 采用可展开的引用块 (expandable blockquote)，直接展示节点，客户端可原生点击下拉展开。
+    # Telegram 单消息 4096 字符硬限制：除了最多 60 个，还按字符预算截断（长节点名 / 长订阅链接
+    # 叠加时 60 行也可能超限，导致 editMessageText 直接 BadRequest、详情页打不开）。
     display_limit = 60
-    display_nodes = nodes[:display_limit]
-    node_lines = [
-        f"• {html.escape(str(n.get('name') or '未命名'))}" for n in display_nodes
-    ]
+    err = sub.get("last_error")
+    err_text = truncate_utf16(str(err), 300) if err else ""
+    url_text = truncate_utf16(str(sub.get("url") or ""), 600)
+    fixed_cost = 700 + _utf16_len(html.escape(str(sub.get("name") or ""))) + _utf16_len(html.escape(url_text)) + _utf16_len(html.escape(err_text))
+    node_budget = max(300, TG_SAFE_BODY - fixed_cost)
+    node_lines: list[str] = []
+    used = 0
+    for n in nodes[:display_limit]:
+        line = f"• {html.escape(truncate_utf16(str(n.get('name') or '未命名'), 80))}"
+        cost = _utf16_len(line) + 1
+        if used + cost > node_budget:
+            break
+        node_lines.append(line)
+        used += cost
+    shown = len(node_lines)
     if not node_lines:
         node_preview = "未解析到节点"
     else:
-        if len(nodes) > display_limit:
-            node_lines.append(f"\n<i>（前 {display_limit} 个已展示，点击下方按钮可翻页浏览全量 {len(nodes)} 个节点）</i>")
+        if len(nodes) > shown:
+            node_lines.append(f"\n<i>（前 {shown} 个已展示，点击下方按钮可翻页浏览全量 {len(nodes)} 个节点）</i>")
         node_preview = "\n".join(node_lines)
 
-    err = sub.get("last_error")
-    err_line = f"\n⚠️ 刷新错误: {html.escape(err)}" if err else ""
+    err_line = f"\n⚠️ 刷新错误: {html.escape(err_text)}" if err else ""
     return (
         f"配置名称: <b>{html.escape(sub['name'])}</b>  ({status_badge})\n"
-        f"订阅链接: <code>{html.escape(sub['url'])}</code>\n"
+        f"订阅链接: <code>{html.escape(url_text)}</code>\n"
         f"流量详情: {html.escape(format_bytes_gb(used))} / {html.escape(format_bytes_gb(total))}\n"
         f"使用进度: {html.escape(progress_bar(used, total))}\n"
         f"剩余可用: {html.escape(format_bytes_gb(remain_traffic))}\n"
@@ -677,14 +766,32 @@ async def refresh_sub(
     return updated
 
 
-async def render_list(user_id: int, page: int = 0, sort_mode: str = "默认") -> tuple[str, InlineKeyboardMarkup]:
-    subs = await store.list_subs_meta(user_id)
+def sort_subs(subs: list[dict[str, Any]], sort_mode: str) -> list[dict[str, Any]]:
+    """按排序模式返回新列表（不改入参）。列表页与内联查询共用，保证两处顺序一致。"""
+    out = list(subs)
     if sort_mode == "流量":
-        subs.sort(key=lambda s: (s.get("traffic_total") or 0) - (s.get("traffic_used") or 0), reverse=True)
+        out.sort(key=lambda s: (s.get("traffic_total") or 0) - (s.get("traffic_used") or 0), reverse=True)
     elif sort_mode == "到期":
-        subs.sort(key=lambda s: s.get("expire_at") or 99999999999)
+        out.sort(key=lambda s: s.get("expire_at") or 99999999999)
     elif sort_mode == "名称":
-        subs.sort(key=lambda s: str(s.get("name") or ""))
+        out.sort(key=lambda s: str(s.get("name") or "").casefold())
+    return out
+
+
+def stable_index_map(subs: list[dict[str, Any]]) -> dict[int, int]:
+    """订阅 id → 编号（按 id 升序 1 起）。
+
+    私聊发送数字、详情页 #编号、内联分享 #编号 都按 id 顺序；排序模式只改变展示顺序，
+    不能改变编号，否则「列表上看到 #3，发 3 却打开另一条」。
+    """
+    ordered = sorted(int(s["id"]) for s in subs)
+    return {sid: i for i, sid in enumerate(ordered, start=1)}
+
+
+async def render_list(user_id: int, page: int = 0, sort_mode: str = "默认") -> tuple[str, InlineKeyboardMarkup]:
+    raw_subs = await store.list_subs_meta(user_id)
+    index_of = stable_index_map(raw_subs)
+    subs = sort_subs(raw_subs, sort_mode)
     page_size = 8
     now = int(time.time())
     soon_count = sum(
@@ -699,7 +806,7 @@ async def render_list(user_id: int, page: int = 0, sort_mode: str = "默认") ->
     page = max(0, min(page, total_pages - 1))
     start = page * page_size
     chunk = subs[start : start + page_size]
-    items = [(start + i, sub) for i, sub in enumerate(chunk, start=1)]
+    items = [(index_of.get(int(sub["id"]), start + i), sub) for i, sub in enumerate(chunk, start=1)]
     total_nodes = sum(int(s.get("node_count") or 0) for s in subs)
     bad_count = sum(
         1 for s in subs
@@ -839,12 +946,18 @@ async def cmd_expire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             reply_markup=InlineKeyboardMarkup(nav),
         )
         return
-    summary_lines = [sub_summary_line(idx, s) for idx, s in soon[:8]]
+    # 临期列表一次性展示：正文最多 20 条摘要，按钮最多 40 个且全部在同一“页”内。
+    # 旧实现把全部条目交给 list_keyboard(page_size=8)：超过 8 条时出现指向主列表的
+    # ➡️ 翻页（点了跳到普通订阅列表第 2 页），和正文里写死的“第1/1页”自相矛盾。
+    shown = soon[:40]
+    summary_lines = [sub_summary_line(idx, s) for idx, s in soon[:20]]
+    more = f"\n\n<i>（共 {len(soon)} 条，正文仅展示前 20 条）</i>" if len(soon) > 20 else ""
     text = (
-        f"🟠 <b>临期列表 共{len(soon)}个 | 第1/1页</b>\n\n"
+        f"🟠 <b>临期列表 共{len(soon)}个</b>\n\n"
         + "\n\n".join(summary_lines)
+        + more
     )
-    kb = list_keyboard(0, len(soon), 8, soon)
+    kb = list_keyboard(0, len(shown), max(1, len(shown)), shown)
     await update.effective_message.reply_html(text, reply_markup=kb)
 
 
@@ -918,8 +1031,10 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         nonlocal done
         try:
             async with sem:
+                # rename=False：批量更新不能把用户手动改过的名称覆盖回机场的 profile-title；
+                # 仍是域名/默认名的订阅会由 refresh_sub 内的 looks_like_host_name 自动改名。
                 results[idx] = await refresh_sub(
-                    user_id, sub, rename=True, meta_only=True
+                    user_id, sub, rename=False, meta_only=True
                 )
         except Exception as exc:
             # 单条炸掉不能拖垮整批，标成失败继续
@@ -977,7 +1092,7 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 InlineKeyboardButton("↩️ 暂不删除", callback_data="upd:keepfailed"),
             ],
             [
-                InlineKeyboardButton("📦 订阅列表", callback_data="list:home"),
+                InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
                 InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
             ],
         ])
@@ -988,7 +1103,7 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     else:
         await context.bot.send_message(chat_id=deliver_to, text=stats, reply_markup=MAIN_KB)
-        text_list, kb_list = await render_list(user_id, 0)
+        text_list, kb_list = await render_list(user_id, 0, sort_mode=_current_sort_mode(context))
         await context.bot.send_message(chat_id=deliver_to, text=text_list, reply_markup=kb_list, parse_mode=ParseMode.HTML)
 
 
@@ -1057,21 +1172,20 @@ def _export_copy_keyboard(code: str) -> InlineKeyboardMarkup:
     base64_url = f"{PUBLIC_BASE_URL}/agg/{code}/base64"
     surge_url = f"{PUBLIC_BASE_URL}/agg/{code}/surge"
     qx_url = f"{PUBLIC_BASE_URL}/agg/{code}/qx"
-    return InlineKeyboardMarkup([
+    # PUBLIC_BASE_URL 很长时单个 URL 可能超过 CopyTextButton 的 256 字符上限，超限按钮直接省略
+    rows = _copy_rows(
+        [copy_button("📋 复制 Clash", clash_url), copy_button("📋 复制 Sing-box", singbox_url)],
         [
-            InlineKeyboardButton("📋 复制 Clash", copy_text=CopyTextButton(text=clash_url)),
-            InlineKeyboardButton("📋 复制 Sing-box", copy_text=CopyTextButton(text=singbox_url)),
+            copy_button("📋 复制 Base64", base64_url),
+            copy_button("📋 复制 Surge", surge_url),
+            copy_button("📋 复制 QX", qx_url),
         ],
-        [
-            InlineKeyboardButton("📋 复制 Base64", copy_text=CopyTextButton(text=base64_url)),
-            InlineKeyboardButton("📋 复制 Surge", copy_text=CopyTextButton(text=surge_url)),
-            InlineKeyboardButton("📋 复制 QX", copy_text=CopyTextButton(text=qx_url)),
-        ],
-        [
-            InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
-            InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
-        ],
+    )
+    rows.append([
+        InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+        InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
     ])
+    return InlineKeyboardMarkup(rows)
 
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1138,9 +1252,13 @@ def parse_path_rule(raw: str) -> tuple[str, str] | None:
     return keyword, remark
 
 
+PATH_BUTTON_LIMIT = 40
+
+
 def path_keyboard(maps: list[dict[str, Any]] | None = None) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    for row in maps or []:
+    # Telegram 单条消息最多 100 个内联按钮；规则很多时只给前 40 条提供删除按钮
+    for row in (maps or [])[:PATH_BUTTON_LIMIT]:
         label = f"🗑 {row['node_name']} → {row['remark']}"[:64]
         rows.append([InlineKeyboardButton(label, callback_data=f"path:delete:{int(row['id'])}")])
     rows.append([InlineKeyboardButton("➕ 添加对应", callback_data="path:add")])
@@ -1156,8 +1274,19 @@ async def render_path_page(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             path_keyboard(),
         )
     lines = [f"🧭 <b>路径对应</b>（{len(maps)}）\n"]
+    used = _utf16_len(lines[0])
+    shown = 0
     for row in maps:
-        lines.append(f"• <code>{html.escape(row['node_name'])}</code> → {html.escape(row['remark'])}")
+        line = f"• <code>{html.escape(row['node_name'])}</code> → {html.escape(row['remark'])}"
+        if used + _utf16_len(line) + 1 > TG_SAFE_BODY - 300:
+            break
+        lines.append(line)
+        used += _utf16_len(line) + 1
+        shown += 1
+    if shown < len(maps):
+        lines.append(f"\n<i>（仅展示前 {shown} 条，共 {len(maps)} 条；/path clear 可清空）</i>")
+    elif len(maps) > PATH_BUTTON_LIMIT:
+        lines.append(f"\n<i>（仅前 {PATH_BUTTON_LIMIT} 条提供删除按钮）</i>")
     return "\n".join(lines), path_keyboard(maps)
 
 
@@ -1202,7 +1331,12 @@ async def cmd_delete_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     for sub in hits:
         await store.delete_sub(scope_owner(update), int(sub["id"]))
-    await update.effective_message.reply_text(f"✅ 已删除 {len(hits)} 个匹配订阅。", reply_markup=MAIN_KB)
+    names = "\n".join(f"• {truncate_utf16(str(s['name']), 40)}" for s in hits[:20])
+    more = f"\n… 等共 {len(hits)} 个" if len(hits) > 20 else ""
+    await update.effective_message.reply_text(
+        f"✅ 已删除 {len(hits)} 个匹配订阅：\n{names}{more}\n\n误删可在「♻️ 撤销删除」回收站中 30 天内恢复。",
+        reply_markup=MAIN_KB,
+    )
 
 
 async def cmd_inline_sort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1402,8 +1536,11 @@ async def cmd_github_search(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         lines.append("📦 <b>热门开源仓库：</b>")
         for r in repos_results:
             full_name = html.escape(str(r.get("full_name") or "unknown"))
-            html_url = r.get("html_url") or ""
-            stars = r.get("stargazers_count", 0)
+            html_url = str(r.get("html_url") or "")
+            try:
+                stars = int(r.get("stargazers_count") or 0)
+            except (TypeError, ValueError):
+                stars = 0
             star_str = f"⭐ {stars / 1000:.1f}k" if stars >= 1000 else f"⭐ {stars}"
             desc = html.escape(str(r.get("description") or "无项目描述").strip())
             desc_short = desc[:45] + "…" if len(desc) > 45 else desc
@@ -1454,17 +1591,28 @@ async def render_temp_page(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
     lines = [f"🧪 <b>临时节点</b> ({len(rows)})\n"]
     del_btns: list[InlineKeyboardButton] = []
+    # vmess 等分享链接单条可达数百字符，20 条全文展示会超过 4096 字符硬限制导致整页发不出去。
+    used = _utf16_len(lines[0])
+    shown = 0
     for i, r in enumerate(rows[:20], start=1):
         scheme = (urlparse(str(r.get("url") or "")).scheme or "node").upper()
-        lines.append(f"#{i} [{html.escape(scheme)}] <b>{html.escape(r['name'])}</b>\n<code>{html.escape(r['url'])}</code>")
+        entry = (
+            f"#{i} [{html.escape(scheme)}] <b>{html.escape(truncate_utf16(str(r['name']), 60))}</b>\n"
+            f"<code>{html.escape(truncate_utf16(str(r['url']), 900))}</code>"
+        )
+        if shown and used + _utf16_len(entry) + 2 > TG_SAFE_BODY - 300:
+            break
+        lines.append(entry)
+        used += _utf16_len(entry) + 2
+        shown += 1
         del_btns.append(
             InlineKeyboardButton(
                 f"🗑 #{i} {r['name']}"[:32],
                 callback_data=f"temp:del:{int(r['id'])}",
             )
         )
-    if len(rows) > 20:
-        lines.append(f"<i>（仅展示前 20 条，共 {len(rows)} 条）</i>")
+    if len(rows) > shown:
+        lines.append(f"<i>（仅展示前 {shown} 条，共 {len(rows)} 条）</i>")
 
     kb_rows: list[list[InlineKeyboardButton]] = [
         del_btns[idx : idx + 2] for idx in range(0, min(len(del_btns), 12), 2)
@@ -1474,8 +1622,9 @@ async def render_temp_page(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         InlineKeyboardButton("📦 转为正式订阅", callback_data="temp:tosub"),
         InlineKeyboardButton("🧹 清空全部", callback_data="temp:clear"),
     ]
-    if len(all_urls) <= 256:
-        kb_rows.append([InlineKeyboardButton("📋 一键复制全部链接", copy_text=CopyTextButton(text=all_urls))])
+    copy_all = copy_button("📋 一键复制全部链接", all_urls) if len(rows) <= 15 else None
+    if copy_all is not None:
+        kb_rows.append([copy_all])
     kb_rows.append(action_row)
     kb_rows.append([
         InlineKeyboardButton("📤 聚合导出", callback_data="temp:export"),
@@ -1605,8 +1754,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         sub_id = scoped.pop("editurl_sub_id", None)
         page = scoped.pop("editurl_page", 0)
         scoped.pop("await", None)
-        new_url = text.strip()
-        if not re.match(r"^https?://\S+$", new_url):
+        new_url = clean_url_token(text.strip())
+        if not is_valid_http_url(new_url):
             await update.effective_message.reply_text("❌ 订阅链接格式无效（须为 http/https 链接），已取消更换。", reply_markup=MAIN_KB)
             return
         updated = await store.update_sub(user_id, sub_id, url=new_url)
@@ -1626,7 +1775,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # ── 页码跳转状态机 ──────────────────────────────
     if state == "list_jump":
         scoped.pop("await", None)
-        if not text.isdigit():
+        if not is_ascii_digits(text) or len(text) > 6:
             await update.effective_message.reply_text("❌ 页码必须是数字，已取消跳转。", reply_markup=MAIN_KB)
             return
         page = int(text) - 1
@@ -1692,7 +1841,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 ) as resp:
                     elapsed = time.time() - t0
                     status = resp.status
-                    body = (await resp.text())[:120].replace("\n", " ")
+                    # 只读前 4KB：对端返回超大响应时不能把整个 body 读进内存
+                    raw_body = await resp.content.read(4096)
+                    try:
+                        body_text = raw_body.decode(resp.charset or "utf-8", "replace")
+                    except LookupError:
+                        body_text = raw_body.decode("utf-8", "replace")
+                    body = body_text[:120].replace("\n", " ")
                 # 不回显 Key；只展示状态、延迟和有限响应摘要。
                 mark = "✅" if 200 <= status < 300 else "❌"
                 results.append(f"{mark} {api_url} → HTTP {status} ({elapsed:.1f}s) {body}")
@@ -1702,7 +1857,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not results:
             await update.effective_message.reply_text("未解析到任何 API 地址和 Key。", reply_markup=MAIN_KB)
             return
-        await update.effective_message.reply_text("\n".join(results[:20]), reply_markup=MAIN_KB)
+        await update.effective_message.reply_text(
+            truncate_utf16("\n".join(results[:20]), TG_MESSAGE_LIMIT - 96), reply_markup=MAIN_KB
+        )
         return
 
     # ── 内联排序状态机 ─────────────────────────────
@@ -1740,18 +1897,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if text in ("❓ 帮助菜单", "帮助菜单", "帮助"):
         return await cmd_help(update, context)
 
-    if text.isdigit():
+    if is_ascii_digits(text):
+        if len(text) > 9:
+            await update.effective_message.reply_text("编号不存在。", reply_markup=MAIN_KB)
+            return
         return await show_detail(update, user_id, int(text))
 
     if text.startswith("短链 ") or text.lower().startswith("short "):
-        target = text.split(" ", 1)[1].strip()
-        if not re.match(r"^https?://", target):
-            await update.effective_message.reply_text("短链目标必须是 http/https 链接。")
+        target = clean_url_token(text.split(" ", 1)[1].strip())
+        if not is_valid_http_url(target):
+            await update.effective_message.reply_text("短链目标必须是单个 http/https 链接（不能包含空格或换行）。")
             return
         short = await make_short_url(user_id, target)
-        copy_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 一键复制短链", copy_text=CopyTextButton(text=short))]
-        ])
+        copy_rows = _copy_rows([copy_button("📋 一键复制短链", short)])
+        copy_kb = InlineKeyboardMarkup(copy_rows) if copy_rows else None
         await update.effective_message.reply_html(
             f"✅ 短链已生成\n<code>{html.escape(short)}</code>",
             reply_markup=copy_kb,
@@ -1774,7 +1933,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # name|url
     if "|" in text and re.search(r"https?://", text):
         name, url = [x.strip() for x in text.split("|", 1)]
-        if re.match(r"^https?://", url):
+        name = name[:64].strip()
+        url = clean_url_token(url)
+        if is_valid_http_url(url):
             clean_url = url.rstrip("/")
             existing = [s for s in await store.list_subs_meta(user_id) if s["url"].rstrip("/") == clean_url]
             if existing:
@@ -1803,17 +1964,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
     # subscription urls
-    urls = _unique(re.findall(r"https?://\S+", text))
+    urls = _unique([clean_url_token(u) for u in re.findall(r"https?://\S+", text)])
+    urls = [u for u in urls if is_valid_http_url(u)]
     if urls and not extract_share_links(text):
         existing_subs = await store.list_subs_meta(user_id)
         existing_url_map = {s["url"].rstrip("/"): s for s in existing_subs}
         tasks_spec: list[tuple[bool, dict[str, Any]]] = []
+        # 单条消息新增订阅数与文件导入共用上限，防止一次粘贴几十条把机场并发打爆
+        new_budget = MAX_IMPORTED_SUBSCRIPTIONS
+        skipped_new = 0
 
         for url in urls:
             clean_url = url.rstrip("/")
             if clean_url in existing_url_map:
                 tasks_spec.append((False, existing_url_map[clean_url]))
             else:
+                if new_budget <= 0:
+                    skipped_new += 1
+                    continue
+                new_budget -= 1
                 name = urlparse(url).netloc or "订阅"
                 sub = await store.add_sub(user_id, name, url)
                 existing_url_map[clean_url] = sub
@@ -1821,11 +1990,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         sem = asyncio.Semaphore(max(1, UPDATE_CONCURRENCY))
 
-        async def _refresh_one(sub_row: dict[str, Any]) -> dict[str, Any]:
+        async def _refresh_one(is_new: bool, sub_row: dict[str, Any]) -> dict[str, Any]:
             async with sem:
-                return await refresh_sub(user_id, sub_row, rename=True, meta_only=True)
+                # 只有新增订阅采用机场返回的名称；重复发送已有链接不覆盖用户手动改过的名字
+                return await refresh_sub(user_id, sub_row, rename=is_new, meta_only=True)
 
-        refreshed_rows = await asyncio.gather(*(_refresh_one(s) for _, s in tasks_spec))
+        refreshed_rows = await asyncio.gather(*(_refresh_one(n, s) for n, s in tasks_spec))
         added: list[str] = []
         updated_list: list[str] = []
         for (is_new, _), refreshed in zip(tasks_spec, refreshed_rows):
@@ -1840,7 +2010,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             msg_lines.append("✅ 已添加新增订阅:\n" + "\n".join(added))
         if updated_list:
             msg_lines.append("🔄 检测到重复订阅，已为您自动更新:\n" + "\n".join(updated_list))
-        await update.effective_message.reply_text("\n\n".join(msg_lines), reply_markup=MAIN_KB)
+        if skipped_new:
+            msg_lines.append(f"⚠️ 单次最多新增 {MAX_IMPORTED_SUBSCRIPTIONS} 条订阅，另有 {skipped_new} 条未处理，请分批发送。")
+        await update.effective_message.reply_text(
+            truncate_utf16("\n\n".join(msg_lines), TG_MESSAGE_LIMIT - 96), reply_markup=MAIN_KB
+        )
         return
 
     # node share links
@@ -1930,7 +2104,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 try:
                     async with sem:
                         updated = await refresh_sub(
-                            user_id, sub_row, rename=True, meta_only=True
+                            user_id, sub_row, rename=is_new, meta_only=True
                         )
                     if not is_new:
                         return ("updated", (f"{updated['name']} (已更新)", updated["node_count"]))
@@ -1965,6 +2139,23 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await status.edit_text("\n".join(lines), reply_markup=MAIN_KB, parse_mode=ParseMode.HTML)
 
 
+def _callback_menu_owner(update: Update) -> int | None:
+    """群聊回调所属菜单的发起人 ID；无法判定（私聊、无引用、引用的是 Bot）时返回 None。"""
+    chat = getattr(update, "effective_chat", None)
+    if getattr(chat, "type", None) not in ("group", "supergroup"):
+        return None
+    q = getattr(update, "callback_query", None)
+    message = getattr(q, "message", None) if q is not None else None
+    reply = getattr(message, "reply_to_message", None) if message is not None else None
+    origin = getattr(reply, "from_user", None) if reply is not None else None
+    if origin is None or getattr(origin, "is_bot", False) is True:
+        return None
+    owner_id = getattr(origin, "id", None)
+    if isinstance(owner_id, bool) or not isinstance(owner_id, int):
+        return None
+    return owner_id
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not q:
@@ -1975,13 +2166,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # ── 公开私密分享领取：任何人均可参与，不受管理员白名单拦截 ─────────────────────
     if data.startswith("share:c:"):
         code = data.split(":")[-1]
+        # 内联卡片的回调自带 inline_message_id：即使 BotFather 未开启 inline feedback
+        # （收不到 ChosenInlineResult），首次点击时也能补绑，后续 /start 领取才能同步更新卡片，
+        # 且已发出的卡片不会再被 purge_unsent_share_drafts 当作“未发出草稿”误删。
+        imid = getattr(q, "inline_message_id", None)
+        if isinstance(imid, str) and imid:
+            with suppress(Exception):
+                existing = await store.get_share(code)
+                if existing and not existing.get("inline_message_id"):
+                    await store.bind_inline_message_id(code, imid)
         ok, msg, share = await store.claim_share(code, user_id)
         if not ok:
-            await q.answer(msg, show_alert=True)
+            await q.answer(truncate_utf16(msg, TG_CALLBACK_ALERT_LIMIT), show_alert=True)
             if share and (share["claimed_count"] >= share["max_views"] or share["expire_at"] < int(time.time())):
                 with suppress(Exception):
                     await q.edit_message_text(
-                        f"🔒 <b>私密分享已失效</b>\n\n原因: {msg}\n来自: {html.escape(share.get('sender_name') or '用户')}",
+                        f"🔒 <b>私密分享已失效</b>\n\n原因: {html.escape(msg)}\n来自: {html.escape(share.get('sender_name') or '用户')}",
                         parse_mode=ParseMode.HTML,
                     )
             return
@@ -2021,8 +2221,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"💡 建议先去 @{bot_user} 发送 /start 启用私聊，以后领取自动送达私聊可直接复制！"
             )
 
-        # 截断防超过 Telegram 弹窗字数限制
-        await q.answer(alert_msg[:190], show_alert=True)
+        # Telegram 回调弹窗上限 200 字符（按 UTF-16 计，emoji 占 2）；按码点切 190 仍可能超限报错
+        await q.answer(truncate_utf16(alert_msg, TG_CALLBACK_ALERT_LIMIT), show_alert=True)
 
         # 原地更新卡片进度
         claimed = share["claimed_count"]
@@ -2068,6 +2268,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if await deny(update):
         return
     user_id = scope_owner(update)
+
+    # 群聊里的菜单消息归发起人所有：Bot 在群里回复时会引用发起人的消息。其他成员点击
+    # 别人的按钮时，旧实现会用点击者自己的数据 edit 这条消息——要么把别人的菜单改成
+    # “订阅不存在”，要么把点击者自己的订阅列表直接公开贴到群里。这里改为只弹提示、不改消息。
+    menu_owner = _callback_menu_owner(update)
+    if menu_owner is not None and menu_owner != user_id:
+        await q.answer("这是其他成员的菜单，请自己发送 /list 打开。", show_alert=True)
+        return
 
     await q.answer()
     if data == "noop":
@@ -2169,7 +2377,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await q.edit_message_text("订阅不存在")
             return
         if not nodes_of(sub):
-            sub = await refresh_sub(user_id, sub, rename=True)
+            sub = await refresh_sub(user_id, sub, rename=False)
         subs = await store.list_subs_meta(user_id)
         idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == sub_id), sub_id)
         await q.edit_message_text(
@@ -2313,9 +2521,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         ]
         page_links: list[str] = []
         for i, n in enumerate(chunk_nodes, start=start_idx + 1):
-            n_type = html.escape(str(n.get("type") or "node")).upper()
-            n_name = html.escape(str(n.get("name") or "未命名"))
-            server = str(n.get("server") or "")
+            # 先 upper 再转义：反过来会把 &amp; 变成 Telegram 不认识的 &AMP;
+            n_type = html.escape(str(n.get("type") or "node").upper())
+            n_name = html.escape(truncate_utf16(str(n.get("name") or "未命名"), 60))
+            server = truncate_utf16(str(n.get("server") or ""), 80)
             port = n.get("port") or n.get("server_port") or ""
             ep_str = f" <code>({html.escape(server)}:{html.escape(str(port))})</code>" if server and port else ""
             lines.append(f"<code>#{i:02d}</code> [{n_type}] <b>{n_name}</b>{ep_str}")
@@ -2324,8 +2533,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 page_links.append(link)
 
         if page_links:
-            preview_links = "\n".join(html.escape(l) for l in page_links[:8])
-            lines.append(f"\n🔗 <b>本页分享链接（轻触展开复制）：</b>\n<blockquote expandable><code>{preview_links}</code></blockquote>")
+            # vmess 等链接单条数百字符，8 条全塞进来会超 4096 上限、整页 BadRequest；按剩余预算装填
+            header = "\n🔗 <b>本页分享链接（轻触展开复制）：</b>\n<blockquote expandable><code>"
+            footer = "</code></blockquote>"
+            budget = TG_SAFE_BODY - _utf16_len("\n".join(lines)) - _utf16_len(header) - _utf16_len(footer)
+            picked: list[str] = []
+            for l in page_links[:8]:
+                piece = html.escape(l)
+                cost = _utf16_len(piece) + 1
+                if cost > budget:
+                    break
+                picked.append(piece)
+                budget -= cost
+            if picked:
+                omitted = len(page_links) - len(picked)
+                tail = f"\n<i>（另有 {omitted} 条未展示，可点「导出全部节点文件」获取）</i>" if omitted > 0 else ""
+                lines.append(f"{header}{chr(10).join(picked)}{footer}{tail}")
 
         nav_row: list[InlineKeyboardButton] = []
         if node_page > 0:
@@ -2364,7 +2587,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await q.message.reply_text("订阅不存在")
             return
         if not nodes_of(sub):
-            sub = await refresh_sub(user_id, sub, rename=True)
+            sub = await refresh_sub(user_id, sub, rename=False)
         target = sub_token_url(sub["token"], kind)
         short = await make_short_url(user_id, target)
         title = {
@@ -2374,9 +2597,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "surge": "Surge",
             "qx": "QX",
         }.get(kind, kind)
-        copy_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"📋 一键复制 {title} 链接", copy_text=CopyTextButton(text=short))]
-        ])
+        copy_rows = _copy_rows([copy_button(f"📋 一键复制 {title} 链接", short)])
+        copy_kb = InlineKeyboardMarkup(copy_rows) if copy_rows else None
         await q.message.reply_html(
             f"🔗 <b>{html.escape(title)}</b>（{html.escape(sub['name'])}）\n<code>{html.escape(short)}</code>",
             reply_markup=copy_kb,
@@ -2391,7 +2613,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not sub:
             await q.edit_message_text("订阅不存在")
             return
-        sub = await refresh_sub(user_id, sub, rename=True)
+        sub = await refresh_sub(user_id, sub, rename=False)
         # find display index
         subs = await store.list_subs_meta(user_id)
         idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == sub_id), sub_id)
@@ -2495,17 +2717,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         target = sub_token_url(sub["token"], "clash")
         short = await make_short_url(user_id, target)
-        short_rows = [[InlineKeyboardButton("📋 一键复制短链", copy_text=CopyTextButton(text=short))]]
-        if str(sub.get("url") or "").startswith(("http://", "https://")) and len(str(sub["url"])) <= 256:
-            short_rows.append([InlineKeyboardButton("📋 复制原始订阅链接", copy_text=CopyTextButton(text=str(sub["url"])))])
+        short_rows = _copy_rows(
+            [copy_button("📋 一键复制短链", short)],
+            [copy_button("📋 复制原始订阅链接", str(sub["url"]))]
+            if str(sub.get("url") or "").startswith(("http://", "https://"))
+            else [],
+        )
         await q.message.reply_html(
             "🔗 <b>短链生成成功</b>\n"
             f"🏷️ 原始机场名称：{html.escape(sub['name'])}\n"
-            f"🌐 原始订阅链接：<code>{html.escape(sub['url'])}</code>\n"
+            f"🌐 原始订阅链接：<code>{html.escape(truncate_utf16(str(sub['url']), 1500))}</code>\n"
             f"🌟 生成短链地址：<code>{html.escape(short)}</code>\n"
             "📦 此短链会代理原始订阅，可直接导入客户端\n"
             "⚠️ 注意部分机场无法代理访问，请先自行尝试",
-            reply_markup=InlineKeyboardMarkup(short_rows),
+            reply_markup=InlineKeyboardMarkup(short_rows) if short_rows else None,
             disable_web_page_preview=True,
         )
         return
@@ -2522,8 +2747,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await q.message.reply_text("没有可导出的分享链接（可能来自 YAML 订阅）。")
             return
         content = "\n".join(links)
-        doc = InputFile(content.encode("utf-8"), filename="Base64.txt")
-        await q.message.reply_document(document=doc, caption="📦 节点导出完成")
+        # 内容是逐行明文分享链接（不是 Base64 编码），文件名如实标注
+        doc = InputFile(content.encode("utf-8"), filename="nodes.txt")
+        await q.message.reply_document(document=doc, caption=f"📦 节点导出完成（{len(links)} 条分享链接）")
         return
 
 
@@ -2665,7 +2891,8 @@ async def http_short(request: web.Request) -> web.Response:
     target = row["target_url"]
     if target == "aggregate://all" or target.startswith("aggregate://ids/"):
         raise web.HTTPFound(f"/agg/{code}/clash")
-    if not target.startswith(("http://", "https://")):
+    if not target.startswith(("http://", "https://")) or not is_valid_http_url(target, max_len=8192):
+        # 历史数据里可能存有带换行/空格的目标；直接 HTTPFound 会因 Location 头非法抛 500
         return web.Response(status=400, text="invalid target")
     raise web.HTTPFound(target)
 
@@ -2742,15 +2969,16 @@ def parse_share_query(raw: str) -> tuple[int, int | None, int, str] | None:
     content_parts = []
     for p in parts:
         lower = p.lower()
-        if lower.startswith("x") and lower[1:].isdigit():
+        # 只认 ASCII 数字：'x²'.isdigit() 为 True，但 int('²') 会抛 ValueError，导致整个内联查询崩溃
+        if lower.startswith("x") and is_ascii_digits(lower[1:]) and len(lower) <= 8:
             max_views = max(1, min(100, int(lower[1:])))
-        elif lower.startswith("id") and lower[2:].isdigit():
+        elif lower.startswith("id") and is_ascii_digits(lower[2:]):
             parsed_target = parse_tg_user_id(lower[2:])
             if parsed_target is None:
                 content_parts.append(p)
             else:
                 target_user_id = parsed_target
-        elif lower.startswith("s") and lower[1:].isdigit():
+        elif lower.startswith("s") and is_ascii_digits(lower[1:]) and len(lower) <= 10:
             duration_minutes = max(1, min(10080, int(lower[1:])))
         else:
             content_parts.append(p)
@@ -2768,11 +2996,13 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = iq.from_user.id
     user_name = iq.from_user.first_name or "用户"
     if not await allowed(user_id):
+        # PTB 21+ 已移除 switch_pm_text/switch_pm_parameter，旧写法会直接 TypeError，
+        # 未授权用户的内联查询因此永远得不到任何响应
         await iq.answer(
             [],
             cache_time=5,
-            switch_pm_text="此 Bot 需要授权使用",
-            switch_pm_parameter="denied",
+            is_personal=True,
+            button=InlineQueryResultsButton(text="此 Bot 需要授权使用", start_parameter="denied"),
         )
         return
 
@@ -2788,7 +3018,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # 1. 寻找可能匹配的订阅列表 (候选池)
         candidate_subs: list[tuple[int, dict[str, Any]]] = []
         clean_num = content.lstrip("#").strip()
-        if clean_num.isdigit():
+        if is_ascii_digits(clean_num) and len(clean_num) <= 9:
             idx = int(clean_num)
             if 1 <= idx <= len(subs):
                 candidate_subs.append((idx, subs[idx - 1]))
@@ -2796,7 +3026,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         content_lower = content.lower()
         for i, s in enumerate(subs, 1):
             s_name_lower = str(s.get("name") or "").lower()
-            if content_lower in s_name_lower or s_name_lower in content_lower:
+            if s_name_lower and (content_lower in s_name_lower or s_name_lower in content_lower):
                 if not any(c[1]["id"] == s["id"] for c in candidate_subs):
                     candidate_subs.append((i, s))
 
@@ -2885,14 +3115,10 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     q = raw_query.lower()
-    sort_mode = (context.user_data or {}).get("sort_mode", "默认")
-    subs = await store.list_subs_meta(user_id)
-    if sort_mode == "流量":
-        subs.sort(key=lambda s: (s.get("traffic_total") or 0) - (s.get("traffic_used") or 0), reverse=True)
-    elif sort_mode == "到期":
-        subs.sort(key=lambda s: s.get("expire_at") or 99999999999)
-    elif sort_mode == "名称":
-        subs.sort(key=lambda s: str(s.get("name") or ""))
+    sort_mode = _current_sort_mode(context)
+    raw_subs = await store.list_subs_meta(user_id)
+    index_of = stable_index_map(raw_subs)
+    subs = sort_subs(raw_subs, sort_mode)
     results: list[InlineQueryResultArticle] = []
     for sub in subs:
         blob = f"{sub['name']} {sub['url']}".lower()
@@ -2903,13 +3129,17 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         days = remain_text(sub.get("expire_at"))
         if days == "长期有效":
             days = "长期"
-        title = f"#{int(sub['id'])} {sub['name']} [{remain_s}] {days}"
+        # 标题编号与列表/私聊数字编号一致（按 id 顺序的序号），而不是数据库自增 id
+        title = f"#{index_of.get(int(sub['id']), int(sub['id']))} {sub['name']} [{remain_s}] {days}"
+        sub_url = str(sub["url"] or "")
+        # 本地导入的订阅没有可用的远程链接（uploaded://…），改为发送 Bot 生成的专属订阅地址
+        send_url = sub_token_url(sub["token"], "clash") if sub_url.startswith("uploaded://") else sub_url
         results.append(
             InlineQueryResultArticle(
                 id=f"s{int(sub['id'])}",
                 title=title[:64],
-                description=sub["url"][:100],
-                input_message_content=InputTextMessageContent(sub["url"]),
+                description=send_url[:100],
+                input_message_content=InputTextMessageContent(truncate_utf16(send_url, TG_MESSAGE_LIMIT)),
             )
         )
     for t in await store.list_temp(user_id):
@@ -2936,7 +3166,24 @@ async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_
     # 我们生成的 id 形如 share_sub_{code} 或 share_txt_{code}
     if res_id.startswith("share_sub_") or res_id.startswith("share_txt_"):
         code = res_id.split("_", 2)[-1]
+        share = await store.get_share(code)
+        sender = getattr(getattr(cir, "from_user", None), "id", None)
+        # 只允许分享的创建者本人绑定，且不覆盖已绑定的卡片
+        if not share or share.get("sender_id") != sender or share.get("inline_message_id"):
+            return
         await store.bind_inline_message_id(code, cir.inline_message_id)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """全局异常兜底：记录完整堆栈，并尽量给用户一个可见反馈，而不是按钮一直转圈/毫无回应。"""
+    log.error("Unhandled error while processing update", exc_info=context.error)
+    if not isinstance(update, Update):
+        return
+    with suppress(Exception):
+        if update.callback_query is not None:
+            await update.callback_query.answer("⚠️ 操作失败，请稍后重试。", show_alert=True)
+        elif update.effective_message is not None and update.effective_chat is not None and update.effective_chat.type == "private":
+            await update.effective_message.reply_text("⚠️ 处理出错，请稍后重试。")
 
 
 def build_app() -> Application:
@@ -2946,7 +3193,10 @@ def build_app() -> Application:
     # 注意：绝不在这里设全局 parse_mode —— 大量 reply_text 发的是纯文本提示，
     # 一旦被当 HTML 解析，用户输入里带个 < 或 & 就会让整条消息发送失败。
     defaults = Defaults(link_preview_options=LinkPreviewOptions(is_disabled=True))
-    app = Application.builder().token(BOT_TOKEN).defaults(defaults).build()
+    # concurrent_updates：默认串行处理所有更新，一次「更新所有」(最慢 25s/条) 或文档导入
+    # 会把其他用户的全部交互卡住。数据库层已有全局锁，开启并发是安全的。
+    app = Application.builder().token(BOT_TOKEN).defaults(defaults).concurrent_updates(True).build()
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("auth", cmd_auth))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -3009,18 +3259,27 @@ async def check_and_notify_alerts(
                 await store.set_meta(key, str(now))
 
     if alerts and bot is not None:
-        msg = (
-            "🔔 <b>订阅巡检提醒</b>\n\n"
-            + "\n".join(f"• {a}" for a in alerts)
-            + "\n\n<i>发送 /list 或 /expire 查看详情。</i>"
-        )
-        with suppress(Exception):
-            await bot.send_message(
-                chat_id=user_id,
-                text=msg,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+        header = "🔔 <b>订阅巡检提醒</b>\n\n"
+        footer = "\n\n<i>发送 /list 或 /expire 查看详情。</i>"
+        # 订阅很多时单条提醒可能超过 4096 字符而发送失败（且冷却标记已写入，提醒会静默丢失），按预算分片
+        chunks: list[list[str]] = [[]]
+        used = 0
+        for a in alerts:
+            line = f"• {a}"
+            cost = _utf16_len(line) + 1
+            if chunks[-1] and used + cost > TG_SAFE_BODY - 200:
+                chunks.append([])
+                used = 0
+            chunks[-1].append(line)
+            used += cost
+        for part in chunks:
+            with suppress(Exception):
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=header + "\n".join(part) + footer,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
     return alerts
 
 
@@ -3041,7 +3300,8 @@ async def run_scheduled_maintenance(bot: Any = None) -> dict[str, int]:
         async def _refresh_item(s: dict[str, Any]) -> dict[str, Any]:
             async with sem:
                 try:
-                    return await refresh_sub(uid, s, rename=True, meta_only=True)
+                    # 后台巡检绝不覆盖用户手动设置的名称（rename=False）
+                    return await refresh_sub(uid, s, rename=False, meta_only=True)
                 except Exception as exc:
                     log.warning("scheduled refresh failed for sub #%s: %s", s.get("id"), exc)
                     return s
@@ -3116,9 +3376,18 @@ async def amain() -> None:
 
         await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
         maint_task = asyncio.create_task(_maintenance_loop(app.bot))
-        # run forever
-        while True:
-            await asyncio.sleep(3600)
+        # systemd stop 发送 SIGTERM：默认会直接杀进程、跳过下面的 finally（不关 DB/HTTP/会话）。
+        # 注册信号处理，收到后优雅退出；Windows 不支持 add_signal_handler，回退为 Ctrl+C。
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig_name in ("SIGTERM", "SIGINT"):
+            sig = getattr(signal, sig_name, None)
+            if sig is None:
+                continue
+            with suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.add_signal_handler(sig, stop_event.set)
+        await stop_event.wait()
+        log.info("Shutdown signal received, stopping...")
     finally:
         if maint_task is not None:
             maint_task.cancel()

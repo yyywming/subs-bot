@@ -4,6 +4,7 @@ import asyncio
 import base64
 import ipaddress
 import json
+import math
 import re
 import socket
 from datetime import datetime, timezone
@@ -54,6 +55,26 @@ async def close_session() -> None:
     session, _SESSION = _SESSION, None
     if session is not None and not session.closed:
         await session.close()
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """宽松转 int：端口跳跃（"443-445"）、空串、None、非数字都退回 default，不抛异常。"""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if math.isfinite(value) else default
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_port(node: dict[str, Any]) -> int:
+    """取节点端口；不在 1..65535 范围内一律视为 0（无效）。"""
+    port = _safe_int(node.get("port") or node.get("server_port") or 0)
+    return port if 0 < port <= 65535 else 0
 
 
 def _b64decode(data: str) -> bytes | None:
@@ -234,8 +255,16 @@ def parse_vmess(url: str) -> dict[str, Any] | None:
         }
         if data.get("sni") or data.get("host"):
             node["servername"] = data.get("sni") or data.get("host")
-        if data.get("path"):
-            node["ws-opts"] = {"path": data.get("path"), "headers": {"Host": data.get("host") or ""}}
+        net = str(node["network"]).lower()
+        if net == "grpc":
+            # gRPC 的 serviceName 在 vmess JSON 里复用 path 字段，不能误塞进 ws-opts
+            if data.get("path"):
+                node["grpc-opts"] = {"grpc-service-name": data.get("path")}
+        elif data.get("path") or (net == "ws" and data.get("host")):
+            ws_opts: dict[str, Any] = {"path": data.get("path") or "/"}
+            if data.get("host"):
+                ws_opts["headers"] = {"Host": data.get("host")}
+            node["ws-opts"] = ws_opts
         return node
     except Exception:
         return None
@@ -276,12 +305,16 @@ def _parse_share_link(url: str) -> dict[str, Any] | None:
         })
         if qs.get("security") == "reality":
             node["reality-opts"] = {"public-key": qs.get("pbk") or "", "short-id": qs.get("sid") or ""}
+        _fill_transport_from_query(node, qs)
     elif scheme == "trojan":
         node.update({
             "password": username,
-            "sni": qs.get("sni") or host,
+            "sni": qs.get("sni") or qs.get("peer") or host,
             "skip-cert-verify": qs.get("allowInsecure") in ("1", "true", "True"),
         })
+        if qs.get("type") and qs.get("type") != "tcp":
+            node["network"] = qs.get("type")
+        _fill_transport_from_query(node, qs)
     elif scheme == "ss":
         # ss://base64(method:pass)@host:port、ss://method:pass@host:port
         # 或整段 base64(method:pass@host:port)。解不出服务器就丢弃，不填默认密码。
@@ -293,6 +326,10 @@ def _parse_share_link(url: str) -> dict[str, Any] | None:
             "sni": qs.get("sni") or "",
             "skip-cert-verify": qs.get("insecure") in ("1", "true", "True"),
         })
+        if qs.get("obfs"):
+            node["obfs"] = qs.get("obfs")
+            if qs.get("obfs-password"):
+                node["obfs-password"] = qs.get("obfs-password")
     elif scheme == "tuic":
         node.update({
             "uuid": username,
@@ -305,6 +342,22 @@ def _parse_share_link(url: str) -> dict[str, Any] | None:
     else:
         node["raw"] = url
     return node
+
+
+def _fill_transport_from_query(node: dict[str, Any], qs: dict[str, str]) -> None:
+    """把 vless/trojan 分享链接里的 ws/grpc 传输参数映射成 Clash 字段。
+
+    旧实现只取 type，丢掉了 path/host/serviceName：节点本身的 share 还在，
+    Base64 导出正常，但 Clash/Sing-box 导出的 ws/grpc 节点缺路径，连不上。
+    """
+    network = str(node.get("network") or "tcp").lower()
+    if network in ("ws", "httpupgrade"):
+        ws_opts: dict[str, Any] = {"path": qs.get("path") or "/"}
+        if qs.get("host"):
+            ws_opts["headers"] = {"Host": qs.get("host")}
+        node["ws-opts"] = ws_opts
+    elif network == "grpc" and qs.get("serviceName"):
+        node["grpc-opts"] = {"grpc-service-name": qs.get("serviceName")}
 
 
 def _fill_ss_fields(url: str, node: dict[str, Any], username: str, password: str) -> bool:
@@ -501,14 +554,20 @@ def parse_subscription_headers(headers: aiohttp.typedefs.LooseHeaders | dict[str
         upload = float(kv.get("upload") or 0)
         download = float(kv.get("download") or 0)
         total = float(kv.get("total") or 0)
-        if total > 0:
-            info["traffic_used"] = (upload + download) / (1024 ** 3)
+        # inf/nan 会让后续 int()/格式化炸掉或显示 "inf GB"，直接视为无流量信息
+        if all(math.isfinite(v) for v in (upload, download, total)) and total > 0:
+            info["traffic_used"] = (max(0.0, upload) + max(0.0, download)) / (1024 ** 3)
             info["traffic_total"] = total / (1024 ** 3)
     except Exception:
         pass
     try:
         if kv.get("expire"):
-            info["expire_at"] = int(float(kv["expire"]))
+            expire = float(kv["expire"])
+            if math.isfinite(expire) and expire > 0:
+                # 部分面板下发毫秒级时间戳，按秒解释会落到几万年后，format_expire 直接抛异常
+                if expire > 1e11:
+                    expire /= 1000
+                info["expire_at"] = int(expire)
     except Exception:
         pass
     name = (
@@ -677,7 +736,18 @@ def _resolve_temp_node(node: dict[str, Any]) -> dict[str, Any]:
 
 
 def node_to_share_link(node: dict[str, Any]) -> str:
-    """将节点转换为分享链接；若已有原始 share 则优先返回，否则从 YAML/JSON 结构化字段逆向生成。"""
+    """将节点转换为分享链接；若已有原始 share 则优先返回，否则从 YAML/JSON 结构化字段逆向生成。
+
+    任何畸形字段（端口跳跃字符串、非 dict 的 utls 等）都只让这一个节点返回 ""，
+    不能让整份导出 / 节点浏览页因为一个坏节点抛异常。
+    """
+    try:
+        return _node_to_share_link(node)
+    except Exception:
+        return ""
+
+
+def _node_to_share_link(node: dict[str, Any]) -> str:
     share = str(node.get("share") or "").strip()
     if share:
         return share
@@ -693,7 +763,7 @@ def node_to_share_link(node: dict[str, Any]) -> str:
         typ = "hysteria2"
 
     server = str(n.get("server") or "").strip()
-    port = int(n.get("port") or n.get("server_port") or 0)
+    port = _safe_port(n)
     if not server or port <= 0:
         return ""
     name = str(n.get("name") or f"{typ.upper()} 节点").strip()
@@ -743,7 +813,7 @@ def node_to_share_link(node: dict[str, Any]) -> str:
             "add": server,
             "port": port,
             "id": uuid,
-            "aid": int(n.get("alterId") or n.get("alter_id") or 0),
+            "aid": _safe_int(n.get("alterId") or n.get("alter_id") or 0),
             "scy": str(n.get("cipher") or n.get("security") or "auto"),
             "net": network or "tcp",
             "type": "none",
@@ -785,9 +855,10 @@ def node_to_share_link(node: dict[str, Any]) -> str:
         flow = str(n.get("flow") or "").strip()
         if flow:
             params["flow"] = flow
+        utls = tls_dict.get("utls") if isinstance(tls_dict.get("utls"), dict) else {}
         fp = str(
             n.get("client-fingerprint")
-            or (tls_dict.get("utls") or {}).get("fingerprint", "")
+            or utls.get("fingerprint", "")
             or ""
         ).strip()
         if fp:
@@ -861,7 +932,7 @@ def deduplicate_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         elif typ == "hy2":
             typ = "hysteria2"
         server = str(n.get("server") or "").strip().lower()
-        port = int(n.get("port") or n.get("server_port") or 0)
+        port = _safe_port(n)
         cred = str(n.get("uuid") or n.get("password") or "")
         ws_opts = n.get("ws-opts") if isinstance(n.get("ws-opts"), dict) else {}
         transport = n.get("transport") if isinstance(n.get("transport"), dict) else {}
@@ -1016,13 +1087,19 @@ def to_clash(nodes: list[dict[str, Any]]) -> str:
     return yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
 
 
+def _ini_safe_name(name: str) -> str:
+    """Surge / QX 以逗号、等号分隔字段，节点名里出现这两个符号会把整行拆坏。"""
+    cleaned = re.sub(r"[,=\r\n]+", " ", name).strip()
+    return cleaned or "node"
+
+
 def to_surge(nodes: list[dict[str, Any]]) -> str:
     lines = ["[Proxy]"]
     names = []
     used_names: set[str] = set()
     for raw in nodes:
         n = _resolve_temp_node(raw)
-        name = _unique_node_name(str(n.get("name") or "node"), used_names)
+        name = _unique_node_name(_ini_safe_name(str(n.get("name") or "node")), used_names)
         typ = str(n.get("type") or "").lower()
         if typ == "shadowsocks":
             typ = "ss"
@@ -1056,12 +1133,10 @@ def to_surge(nodes: list[dict[str, Any]]) -> str:
                 f"{name} = vmess, {server}, {port}, username={n.get('uuid') or ''}, tls={'true' if tls_on else 'false'}{ws_extra}"
             )
         elif typ == "vless" and server and port:
-            names.append(name)
-            tls_val = n.get("tls")
-            tls_on = tls_val.get("enabled") if isinstance(tls_val, dict) else bool(tls_val)
-            lines.append(
-                f"{name} = vless, {server}, {port}, username={n.get('uuid') or ''}, tls={'true' if tls_on else 'false'}"
-            )
+            # Surge 不支持 VLESS：写成正式 [Proxy] 行会让整份配置报错，降级为注释保留分享链接
+            share = node_to_share_link(n)
+            if share:
+                lines.append(f"# {name} (Surge 不支持 VLESS): {share}")
         elif typ == "hysteria2" and server and port:
             names.append(name)
             sni = n.get("sni") or n.get("servername") or server
@@ -1091,7 +1166,7 @@ def to_qx(nodes: list[dict[str, Any]]) -> str:
         if share:
             lines.append(str(share))
             continue
-        name = str(n.get("name") or "node")
+        name = _ini_safe_name(str(n.get("name") or "node"))
         typ = str(n.get("type") or "").lower()
         if typ == "shadowsocks":
             typ = "ss"
@@ -1118,6 +1193,17 @@ def to_qx(nodes: list[dict[str, Any]]) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
+_SINGBOX_OUTBOUND_TYPES = frozenset({
+    "shadowsocks", "vmess", "vless", "trojan", "hysteria", "hysteria2", "tuic",
+    "socks", "http", "wireguard", "shadowtls", "ssh", "anytls",
+})
+# 由 Clash 字段转换时能可靠映射的协议；wireguard/hysteria(v1) 等字段体系差异过大，
+# 硬转只会生成 sing-box 拒绝加载的配置，因此跳过（Base64/Clash 导出不受影响）。
+_SINGBOX_FROM_CLASH_TYPES = frozenset({
+    "shadowsocks", "vmess", "vless", "trojan", "hysteria2", "tuic", "socks", "http", "anytls",
+})
+
+
 def to_singbox(nodes: list[dict[str, Any]]) -> str:
     outbounds = []
     tags = []
@@ -1125,21 +1211,41 @@ def to_singbox(nodes: list[dict[str, Any]]) -> str:
     for raw in nodes:
         n = _resolve_temp_node(raw)
         server = n.get("server")
-        port = n.get("server_port") or n.get("port")
+        port = _safe_port(n)
         if not server or not port:
             continue
-        tag = _unique_node_name(str(n.get("name") or "node"), used_tags)
         typ = str(n.get("type") or "unknown").lower()
         if typ == "ss":
             typ = "shadowsocks"
         elif typ == "hy2":
             typ = "hysteria2"
+        elif typ in ("socks5", "socks5-tls"):
+            typ = "socks"
+
+        # 原本就来自 sing-box outbounds 的节点（带 server_port、不带 port）：原样透传全部字段，
+        # 避免把 obfs、multiplex、up_mbps 等本可直接使用的配置丢掉。
+        if "server_port" in n and "port" not in n:
+            if typ not in _SINGBOX_OUTBOUND_TYPES:
+                continue
+            tag = _unique_node_name(str(n.get("name") or "node"), used_tags)
+            ob = {"tag": tag, "type": typ}
+            ob.update({k: v for k, v in n.items() if k not in ("name", "type", "share", "raw", "tag")})
+            ob["server"] = str(server)
+            ob["server_port"] = port
+            outbounds.append(ob)
+            tags.append(tag)
+            continue
+
+        # 未知/不支持的协议（ssr、snell、temp…）写进去会让 sing-box 整份配置加载失败
+        if typ not in _SINGBOX_FROM_CLASH_TYPES:
+            continue
+        tag = _unique_node_name(str(n.get("name") or "node"), used_tags)
 
         ob: dict[str, Any] = {
             "tag": tag,
             "type": typ,
             "server": str(server),
-            "server_port": int(port),
+            "server_port": port,
         }
 
         if typ == "shadowsocks":
@@ -1149,14 +1255,24 @@ def to_singbox(nodes: list[dict[str, Any]]) -> str:
             if n.get("uuid"):
                 ob["uuid"] = str(n["uuid"])
             ob["security"] = str(n.get("security") or n.get("cipher") or "auto")
-            ob["alter_id"] = int(n.get("alter_id") or n.get("alterId") or 0)
+            ob["alter_id"] = _safe_int(n.get("alter_id") or n.get("alterId") or 0)
         elif typ == "vless":
             if n.get("uuid"):
                 ob["uuid"] = str(n["uuid"])
             if n.get("flow"):
                 ob["flow"] = str(n["flow"])
-        elif typ in ("trojan", "hysteria2"):
+        elif typ in ("trojan", "hysteria2", "anytls"):
             if n.get("password") is not None:
+                ob["password"] = str(n["password"])
+            if typ == "hysteria2" and n.get("obfs"):
+                obfs: dict[str, Any] = {"type": str(n["obfs"])}
+                if n.get("obfs-password"):
+                    obfs["password"] = str(n["obfs-password"])
+                ob["obfs"] = obfs
+        elif typ in ("socks", "http"):
+            if n.get("username"):
+                ob["username"] = str(n["username"])
+            if n.get("password"):
                 ob["password"] = str(n["password"])
         elif typ == "tuic":
             if n.get("uuid"):
@@ -1176,7 +1292,7 @@ def to_singbox(nodes: list[dict[str, Any]]) -> str:
         raw_tls = n.get("tls")
         if isinstance(raw_tls, dict):
             ob["tls"] = dict(raw_tls)
-        elif raw_tls is True or typ in ("trojan", "hysteria2", "tuic") or isinstance(n.get("reality-opts"), dict):
+        elif raw_tls is True or typ in ("trojan", "hysteria2", "tuic", "anytls") or isinstance(n.get("reality-opts"), dict):
             tls_obj: dict[str, Any] = {"enabled": True}
             sni = str(n.get("sni") or n.get("servername") or server or "").strip()
             if sni:
@@ -1238,7 +1354,11 @@ def format_bytes_gb(val: float | None) -> str:
 def format_expire(ts: int | None) -> str:
     if not ts:
         return "长期有效"
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
+    try:
+        dt = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone()
+    except (OverflowError, OSError, ValueError, TypeError):
+        # 异常时间戳（毫秒级、远超 9999 年等）不能让详情页整体渲染失败
+        return "未知"
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
