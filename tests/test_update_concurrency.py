@@ -82,6 +82,7 @@ class FakeCtx:
 
 
 async def main() -> None:
+    orig_refresh = B.refresh_sub
     await B.store.init()
 
     # ── 造 12 条订阅 ──────────────────────────────────────────────────────────
@@ -213,6 +214,7 @@ async def main() -> None:
     check("20 并发只拿到一个 session", len({id(x) for x in got}) == 1, f"{len({id(x) for x in got})} 个")
     await C.close_session()
 
+    B.refresh_sub = orig_refresh
     await B.store.close()
     print()
     if FAILED:
@@ -221,4 +223,5 @@ async def main() -> None:
     print("✅ 全部通过")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

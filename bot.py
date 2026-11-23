@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import json
 import logging
@@ -8,7 +9,7 @@ import re
 import time
 from contextlib import suppress
 from typing import Any
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote, quote_plus, urlparse
 
 import aiohttp
 from aiohttp import web
@@ -38,6 +39,9 @@ from telegram.ext import (
 
 import config
 from config import (
+    ALERT_EXPIRE_DAYS,
+    ALERT_TRAFFIC_GB,
+    AUTO_REFRESH_HOURS,
     BOT_TOKEN,
     BOT_USERNAME,
     GITHUB_TOKEN,
@@ -57,13 +61,17 @@ from convert import (
     apply_path_maps,
     close_session,
     decode_subscription_bytes,
+    deduplicate_nodes,
     extract_share_links,
     fetch_subscription,
     format_bytes_gb,
     format_expire,
+    format_subscription_userinfo,
     get_session,
     node_name_from_url,
+    node_to_share_link,
     parse_nodes_from_text,
+    parse_share_link,
     remain_text,
     to_base64_sub,
     to_clash,
@@ -525,7 +533,22 @@ def detail_keyboard(sub_id: int, page: int = 0, node_count: int = 0) -> InlineKe
     return InlineKeyboardMarkup(rows)
 
 
-def list_keyboard(page: int, total: int, page_size: int = 8, items: list[tuple[int, dict[str, Any]]] | None = None) -> InlineKeyboardMarkup:
+SORT_MODES = ("默认", "流量", "到期", "名称")
+
+
+def _current_sort_mode(context: ContextTypes.DEFAULT_TYPE | Any) -> str:
+    data = getattr(context, "user_data", None)
+    mode = data.get("sort_mode", "默认") if isinstance(data, dict) else "默认"
+    return mode if mode in SORT_MODES else "默认"
+
+
+def list_keyboard(
+    page: int,
+    total: int,
+    page_size: int = 8,
+    items: list[tuple[int, dict[str, Any]]] | None = None,
+    sort_mode: str = "默认",
+) -> InlineKeyboardMarkup:
     pages = max(1, (total + page_size - 1) // page_size)
     rows: list[list[InlineKeyboardButton]] = []
     if items:
@@ -544,6 +567,7 @@ def list_keyboard(page: int, total: int, page_size: int = 8, items: list[tuple[i
         nav.append(InlineKeyboardButton("➡️", callback_data=f"list:page:{page+1}"))
     rows.append(nav)
     rows.append([
+        InlineKeyboardButton(f"🔀 排序:{sort_mode}", callback_data=f"list:sort:{page}"),
         InlineKeyboardButton("🔢 跳转页", callback_data="list:jump"),
         InlineKeyboardButton("🔄 更新所有", callback_data="list:updateall"),
     ])
@@ -630,7 +654,7 @@ async def render_list(user_id: int, page: int = 0, sort_mode: str = "默认") ->
     chunk = subs[start : start + page_size]
     items = [(start + i, sub) for i, sub in enumerate(chunk, start=1)]
     text = f"📁 <b>订阅列表 共{len(subs)}个 | 🟠{soon_count}个临期 | 第{page + 1}/{total_pages}页</b>"
-    return text, list_keyboard(page, len(subs), page_size, items)
+    return text, list_keyboard(page, len(subs), page_size, items, sort_mode=sort_mode)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -728,7 +752,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
-    text, kb = await render_list(scope_owner(update), 0)
+    text, kb = await render_list(scope_owner(update), 0, sort_mode=_current_sort_mode(context))
     await update.effective_message.reply_html(text, reply_markup=kb, disable_web_page_preview=True)
 
 
@@ -939,27 +963,26 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     user_id = scope_owner(update)
     subs = await store.list_subs(user_id)
-    maps = {m["node_name"]: m["remark"] for m in await store.list_path_maps(user_id)}
-    all_nodes: list[dict[str, Any]] = []
     for sub in subs:
-        nodes = nodes_of(sub)
-        if not nodes:
-            sub = await refresh_sub(user_id, sub)
-            nodes = nodes_of(sub)
-        all_nodes.extend(apply_path_maps(nodes, maps))
-    temp = await store.list_temp(user_id)
-    for t in temp:
-        all_nodes.append({"name": t["name"], "share": t["url"], "type": "temp"})
+        if not nodes_of(sub):
+            await refresh_sub(user_id, sub)
+    all_nodes = await mapped_nodes_for_user(user_id)
     if not all_nodes:
         await update.effective_message.reply_text("暂无可导出节点。", reply_markup=MAIN_KB)
         return
     code = await store.create_short(user_id, "aggregate://all")
     clash_url = f"{PUBLIC_BASE_URL}/agg/{code}/clash"
+    singbox_url = f"{PUBLIC_BASE_URL}/agg/{code}/singbox"
     base64_url = f"{PUBLIC_BASE_URL}/agg/{code}/base64"
+    surge_url = f"{PUBLIC_BASE_URL}/agg/{code}/surge"
+    qx_url = f"{PUBLIC_BASE_URL}/agg/{code}/qx"
     await update.effective_message.reply_html(
-        f"📦 <b>导出完成</b>\n节点数: {len(all_nodes)}\n\n"
-        f"Clash:\n<code>{html.escape(clash_url)}</code>\n"
-        f"Base64:\n<code>{html.escape(base64_url)}</code>\n\n"
+        f"📦 <b>导出完成</b>\n节点数: {len(all_nodes)}（已自动去重）\n\n"
+        f"Clash Meta:\n<code>{html.escape(clash_url)}</code>\n"
+        f"Sing-box:\n<code>{html.escape(singbox_url)}</code>\n"
+        f"Base64:\n<code>{html.escape(base64_url)}</code>\n"
+        f"Surge:\n<code>{html.escape(surge_url)}</code>\n"
+        f"QX:\n<code>{html.escape(qx_url)}</code>\n\n"
         f"短链码: <code>{html.escape(code)}</code>",
         reply_markup=MAIN_KB,
         disable_web_page_preview=True,
@@ -1170,44 +1193,51 @@ async def cmd_github_search(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     try:
         timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            # 1. 优先搜索高赞开源仓库 (免 Token 100% 可用)
-            repo_url = f"https://api.github.com/search/repositories?q={quote_plus(query)}&sort=stars&order=desc&per_page=5"
+        session = await get_session()
+        repo_url = f"https://api.github.com/search/repositories?q={quote_plus(query)}&sort=stars&order=desc&per_page=5"
+        code_query = query
+        if not GITHUB_TOKEN and " " not in query:
+            code_query = f"{query} extension:yaml extension:txt"
+        code_url = f"https://api.github.com/search/code?q={quote_plus(code_query)}&per_page=5"
+
+        async def _fetch_repos() -> list[dict[str, Any]]:
             try:
-                async with session.get(repo_url) as resp:
+                async with session.get(repo_url, headers=headers, timeout=timeout) as resp:
                     if resp.status == 200:
                         payload = await resp.json(content_type=None)
-                        repos_results = payload.get("items") or []
+                        return payload.get("items") or []
             except Exception as e:
                 log.warning("GitHub repo search failed: %s", e)
+            return []
 
-            # 2. 搜索公开代码 (有 Token 优先，无 Token 带扩展名)
-            code_query = query
-            if not GITHUB_TOKEN and " " not in query:
-                code_query = f"{query} extension:yaml extension:txt"
-            code_url = f"https://api.github.com/search/code?q={quote_plus(code_query)}&per_page=5"
+        async def _fetch_code() -> list[dict[str, Any]]:
             try:
-                async with session.get(code_url) as resp:
+                async with session.get(code_url, headers=headers, timeout=timeout) as resp:
                     if resp.status == 200:
                         payload = await resp.json(content_type=None)
-                        code_results = payload.get("items") or []
+                        return payload.get("items") or []
             except Exception as e:
                 log.warning("GitHub code search failed: %s", e)
+            return []
 
-            # 3. 如果代码为空，尝试备用 grep.app
-            if not code_results:
-                try:
-                    async with session.get(
-                        f"https://grep.app/api/search?q={quote_plus(query)}&regexp=false"
-                    ) as resp:
-                        if resp.status == 200:
-                            payload = await resp.json(content_type=None)
-                            grep_items = payload.get("hits", {}).get("hits", [])
-                            if grep_items:
-                                source = "grep.app"
-                                code_results = grep_items[:5]
-                except Exception:
-                    pass
+        repos_results, code_results = await asyncio.gather(_fetch_repos(), _fetch_code())
+
+        # 如果代码为空，尝试备用 grep.app
+        if not code_results:
+            try:
+                async with session.get(
+                    f"https://grep.app/api/search?q={quote_plus(query)}&regexp=false",
+                    headers=headers,
+                    timeout=timeout,
+                ) as resp:
+                    if resp.status == 200:
+                        payload = await resp.json(content_type=None)
+                        grep_items = payload.get("hits", {}).get("hits", [])
+                        if grep_items:
+                            source = "grep.app"
+                            code_results = grep_items[:5]
+            except Exception:
+                pass
 
     except Exception as exc:
         log.warning("GitHub multi-search error: %s", exc)
@@ -1406,7 +1436,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"❌ 页码超出范围（最大 {max_page + 1}），已取消。", reply_markup=MAIN_KB
             )
             return
-        text_out, kb = await render_list(user_id, page)
+        text_out, kb = await render_list(user_id, page, sort_mode=_current_sort_mode(context))
         await update.effective_message.reply_html(text_out, reply_markup=kb, disable_web_page_preview=True)
         return
 
@@ -1565,26 +1595,37 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
     # subscription urls
-    urls = re.findall(r"https?://\S+", text)
+    urls = _unique(re.findall(r"https?://\S+", text))
     if urls and not extract_share_links(text):
-        added = []
-        updated_list = []
         existing_subs = await store.list_subs_meta(user_id)
         existing_url_map = {s["url"].rstrip("/"): s for s in existing_subs}
+        tasks_spec: list[tuple[bool, dict[str, Any]]] = []
 
         for url in urls:
             clean_url = url.rstrip("/")
             if clean_url in existing_url_map:
-                old_sub = existing_url_map[clean_url]
-                refreshed = await refresh_sub(
-                    user_id, old_sub, rename=True, meta_only=True
-                )
-                updated_list.append(f"{refreshed['name']} ({refreshed['node_count']} 节点)")
+                tasks_spec.append((False, existing_url_map[clean_url]))
             else:
                 name = urlparse(url).netloc or "订阅"
                 sub = await store.add_sub(user_id, name, url)
-                sub = await refresh_sub(user_id, sub, rename=True, meta_only=True)
-                added.append(f"{sub['name']} ({sub['node_count']} 节点)")
+                existing_url_map[clean_url] = sub
+                tasks_spec.append((True, sub))
+
+        sem = asyncio.Semaphore(max(1, UPDATE_CONCURRENCY))
+
+        async def _refresh_one(sub_row: dict[str, Any]) -> dict[str, Any]:
+            async with sem:
+                return await refresh_sub(user_id, sub_row, rename=True, meta_only=True)
+
+        refreshed_rows = await asyncio.gather(*(_refresh_one(s) for _, s in tasks_spec))
+        added: list[str] = []
+        updated_list: list[str] = []
+        for (is_new, _), refreshed in zip(tasks_spec, refreshed_rows):
+            line_str = f"{refreshed['name']} ({refreshed['node_count']} 节点)"
+            if is_new:
+                added.append(line_str)
+            else:
+                updated_list.append(line_str)
 
         msg_lines = []
         if added:
@@ -1660,30 +1701,49 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not parsed_nodes or all(node.get("share") for node in parsed_nodes):
         existing_url_norm = {sub["url"].rstrip("/"): sub for sub in await store.list_subs_meta(user_id)}
         urls = _unique(value.rstrip(".,;:!?)]}>\"\'") for value in re.findall(r"https?://[^\s<>\"]+", text))
+        doc_specs: list[tuple[bool, str, dict[str, Any]]] = []
         for url in urls[:MAX_IMPORTED_SUBSCRIPTIONS]:
             clean_url = url.rstrip("/")
             if clean_url in existing_url_norm:
-                old_sub = existing_url_norm[clean_url]
-                try:
-                    updated = await refresh_sub(
-                        user_id, old_sub, rename=True, meta_only=True
-                    )
-                    created.append((f"{updated['name']} (已更新)", updated['node_count']))
-                except Exception:
-                    skipped += 1
+                doc_specs.append((False, clean_url, existing_url_norm[clean_url]))
                 continue
             name = urlparse(url).netloc or "订阅"
             try:
                 sub = await store.add_sub(user_id, name, url)
-                updated = await refresh_sub(
-                    user_id, sub, rename=True, meta_only=True
-                )
-                if updated.get("last_error"):
-                    failures.append(f"{name}: {updated['last_error']}")
-                else:
-                    created.append((str(updated.get("name") or name), updated['node_count']))
+                existing_url_norm[clean_url] = sub
+                doc_specs.append((True, name, sub))
             except Exception as exc:
                 failures.append(f"{name}: {exc}")
+
+        if doc_specs:
+            sem = asyncio.Semaphore(max(1, UPDATE_CONCURRENCY))
+
+            async def _doc_refresh(is_new: bool, fallback_name: str, sub_row: dict[str, Any]) -> tuple[str, Any]:
+                try:
+                    async with sem:
+                        updated = await refresh_sub(
+                            user_id, sub_row, rename=True, meta_only=True
+                        )
+                    if not is_new:
+                        return ("updated", (f"{updated['name']} (已更新)", updated["node_count"]))
+                    if updated.get("last_error"):
+                        return ("failed", f"{fallback_name}: {updated['last_error']}")
+                    return ("created", (str(updated.get("name") or fallback_name), updated["node_count"]))
+                except Exception as exc:
+                    if not is_new:
+                        return ("skipped", 1)
+                    return ("failed", f"{fallback_name}: {exc}")
+
+            outcomes = await asyncio.gather(
+                *(_doc_refresh(is_new, fname, srow) for is_new, fname, srow in doc_specs)
+            )
+            for kind_tag, val in outcomes:
+                if kind_tag in ("created", "updated"):
+                    created.append(val)
+                elif kind_tag == "skipped":
+                    skipped += 1
+                elif kind_tag == "failed":
+                    failures.append(str(val))
 
     lines = [f"✅ 已处理文件：{html.escape(filename)}"]
     for name, count in created:
@@ -1876,9 +1936,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         with suppress(Exception):
             await q.edit_message_text(f"✅ 已删除 {removed} 条失效订阅。", reply_markup=done_kb)
         return
+    if data.startswith("list:sort:"):
+        page = int(data.split(":")[-1])
+        cur_mode = _current_sort_mode(context)
+        next_mode = SORT_MODES[(SORT_MODES.index(cur_mode) + 1) % len(SORT_MODES)]
+        if context.user_data is None:
+            context.user_data = {}
+        context.user_data["sort_mode"] = next_mode
+        text, kb = await render_list(user_id, page, sort_mode=next_mode)
+        with suppress(Exception):
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+        return
     if data.startswith("list:page:"):
         page = int(data.split(":")[-1])
-        text, kb = await render_list(user_id, page)
+        text, kb = await render_list(user_id, page, sort_mode=_current_sort_mode(context))
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
         return
     if data.startswith("sub:open:"):
@@ -1961,7 +2032,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if data.startswith("sub:back:"):
         page = int(data.split(":")[-1])
-        text, kb = await render_list(user_id, page)
+        text, kb = await render_list(user_id, page, sort_mode=_current_sort_mode(context))
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
         return
     if data.startswith("sub:fmt:"):
@@ -2049,7 +2120,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         sub_id = int(parts[2])
         page = int(parts[3]) if len(parts) > 3 else 0
         ok = await store.delete_sub(user_id, sub_id)
-        text, kb = await render_list(user_id, page)
+        text, kb = await render_list(user_id, page, sort_mode=_current_sort_mode(context))
         prefix = "✅ 已删除\n\n" if ok else "❌ 删除失败\n\n"
         await q.edit_message_text(prefix + text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
         return
@@ -2089,7 +2160,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
 
-async def mapped_nodes_for_user(user_id: int, sub_ids: list[int] | None = None) -> list[dict[str, Any]]:
+def _temp_row_to_node(t: dict[str, Any]) -> dict[str, Any]:
+    url = str(t.get("url") or "").strip()
+    name = str(t.get("name") or "").strip() or node_name_from_url(url)
+    parsed = parse_share_link(url)
+    if parsed:
+        node = dict(parsed)
+        node["name"] = name
+        node["share"] = url
+        return node
+    return {"name": name, "type": "temp", "share": url}
+
+
+async def mapped_nodes_for_user(
+    user_id: int, sub_ids: list[int] | None = None, *, dedup: bool = True
+) -> list[dict[str, Any]]:
     maps = {m["node_name"]: m["remark"] for m in await store.list_path_maps(user_id)}
     if sub_ids is None:
         subs = await store.list_subs(user_id)
@@ -2103,30 +2188,63 @@ async def mapped_nodes_for_user(user_id: int, sub_ids: list[int] | None = None) 
     for sub in subs:
         nodes.extend(apply_path_maps(nodes_of(sub), maps))
     if sub_ids is None:
-        for t in await store.list_temp(user_id):
-            nodes.append({"name": t["name"], "type": "temp", "share": t["url"]})
-    return nodes
+        temp_nodes = [_temp_row_to_node(t) for t in await store.list_temp(user_id)]
+        nodes.extend(apply_path_maps(temp_nodes, maps))
+    return deduplicate_nodes(nodes) if dedup else nodes
 
+
+def _render_subscription_response(
+    nodes: list[dict[str, Any]],
+    kind: str,
+    *,
+    subs_meta: list[dict[str, Any]] | dict[str, Any] | None = None,
+    profile_title: str | None = None,
+) -> web.Response:
+    headers: dict[str, str] = {"Cache-Control": "no-store, private"}
+    if subs_meta is not None:
+        userinfo = format_subscription_userinfo(subs_meta)
+        if userinfo:
+            headers["subscription-userinfo"] = userinfo
+    if profile_title:
+        clean_title = profile_title.strip()[:64]
+        if clean_title:
+            b64_title = base64.b64encode(clean_title.encode("utf-8")).decode("ascii")
+            headers["profile-title"] = f"base64:{b64_title}"
+            ext = ".json" if kind in ("singbox", "sing-box") else (".yaml" if kind == "clash" else ".txt")
+            headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(clean_title + ext)}"
+
+    if kind in ("base64", "v2ray", "mixed"):
+        return web.Response(text=to_base64_sub(nodes), content_type="text/plain", headers=headers)
+    if kind in ("singbox", "sing-box"):
+        return web.Response(text=to_singbox(nodes), content_type="application/json", headers=headers)
+    if kind == "surge":
+        return web.Response(text=to_surge(nodes), content_type="text/plain", headers=headers)
+    if kind in ("qx", "quantumult", "quantumultx"):
+        return web.Response(text=to_qx(nodes), content_type="text/plain", headers=headers)
+    return web.Response(text=to_clash(nodes), content_type="text/yaml", headers=headers)
 
 
 async def http_sub(request: web.Request) -> web.Response:
     token = request.match_info["token"]
-    kind = request.match_info.get("kind", "clash").lower()
+    kind = (
+        request.match_info.get("kind")
+        or request.query.get("format")
+        or request.query.get("type")
+        or "clash"
+    ).lower()
     sub = await store.get_sub_by_token(token)
     if not sub:
         return web.Response(status=404, text="not found")
     maps = {m["node_name"]: m["remark"] for m in await store.list_path_maps(int(sub["user_id"]))}
     nodes = apply_path_maps(nodes_of(sub), maps)
-    no_store = {"Cache-Control": "no-store, private"}
-    if kind in ("base64", "v2ray", "mixed"):
-        return web.Response(text=to_base64_sub(nodes), content_type="text/plain", headers=no_store)
-    if kind in ("singbox", "sing-box"):
-        return web.Response(text=to_singbox(nodes), content_type="application/json", headers=no_store)
-    if kind == "surge":
-        return web.Response(text=to_surge(nodes), content_type="text/plain", headers=no_store)
-    if kind in ("qx", "quantumult", "quantumultx"):
-        return web.Response(text=to_qx(nodes), content_type="text/plain", headers=no_store)
-    return web.Response(text=to_clash(nodes), content_type="text/yaml", headers=no_store)
+    if request.query.get("dedup", "1") != "0":
+        nodes = deduplicate_nodes(nodes)
+    return _render_subscription_response(
+        nodes,
+        kind,
+        subs_meta=sub,
+        profile_title=str(sub.get("name") or "subs-bot"),
+    )
 
 
 async def http_agg(request: web.Request) -> web.Response:
@@ -2136,8 +2254,10 @@ async def http_agg(request: web.Request) -> web.Response:
         return web.Response(status=404, text="not found")
     target = str(row["target_url"])
     user_id = int(row["user_id"])
+    dedup = request.query.get("dedup", "1") != "0"
     if target == "aggregate://all":
-        nodes = await mapped_nodes_for_user(user_id)
+        nodes = await mapped_nodes_for_user(user_id, dedup=dedup)
+        subs_meta = await store.list_subs_meta(user_id)
     elif target.startswith("aggregate://ids/"):
         raw_ids = target.removeprefix("aggregate://ids/")
         try:
@@ -2146,20 +2266,26 @@ async def http_agg(request: web.Request) -> web.Response:
             return web.Response(status=400, text="invalid aggregate target")
         if not sub_ids:
             return web.Response(status=404, text="not found")
-        nodes = await mapped_nodes_for_user(user_id, sub_ids)
+        nodes = await mapped_nodes_for_user(user_id, sub_ids, dedup=dedup)
+        subs_meta = [
+            meta
+            for sid in sub_ids
+            if (meta := await store.get_sub_meta(user_id, sid)) is not None
+        ]
     else:
         return web.Response(status=404, text="not found")
-    kind = request.match_info.get("kind", "clash").lower()
-    no_store = {"Cache-Control": "no-store, private"}
-    if kind in ("base64", "v2ray", "mixed"):
-        return web.Response(text=to_base64_sub(nodes), content_type="text/plain", headers=no_store)
-    if kind in ("singbox", "sing-box"):
-        return web.Response(text=to_singbox(nodes), content_type="application/json", headers=no_store)
-    if kind == "surge":
-        return web.Response(text=to_surge(nodes), content_type="text/plain", headers=no_store)
-    if kind in ("qx", "quantumult", "quantumultx"):
-        return web.Response(text=to_qx(nodes), content_type="text/plain", headers=no_store)
-    return web.Response(text=to_clash(nodes), content_type="text/yaml", headers=no_store)
+    kind = (
+        request.match_info.get("kind")
+        or request.query.get("format")
+        or request.query.get("type")
+        or "clash"
+    ).lower()
+    return _render_subscription_response(
+        nodes,
+        kind,
+        subs_meta=subs_meta,
+        profile_title="subs-bot 聚合订阅",
+    )
 
 
 
@@ -2188,6 +2314,7 @@ async def start_http(app: Application) -> web.AppRunner:
     api.router.add_get("/sub/{token}/{kind}", http_sub)
     api.router.add_get("/sub/{token}", http_sub)
     api.router.add_get("/agg/{code}/{kind}", http_agg)
+    api.router.add_get("/agg/{code}", http_agg)
     api.router.add_get("/s/{code}", http_short)
     runner = web.AppRunner(api)
     await runner.setup()
@@ -2286,6 +2413,8 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     share_parsed = parse_share_query(raw_query)
     if share_parsed:
         max_views, target_user_id, duration_minutes, content = share_parsed
+        with suppress(Exception):
+            await store.purge_unsent_share_drafts(user_id, within_seconds=3)
         subs = await store.list_subs_meta(user_id)
         results: list[InlineQueryResultArticle] = []
 
@@ -2324,7 +2453,9 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 duration_minutes=duration_minutes,
             )
             card_title = f"🔒 分享订阅: #{display_idx} {sub_name} (限{max_views}份/{duration_minutes}m{target_hint})"
-            card_desc = f"原始链接: {sub['url'][:50]}…"
+            remain_val = remain_traffic_gb(sub)
+            remain_str = f"{remain_val:.2f} GB" if remain_val is not None else "? GB"
+            card_desc = f"节点: {sub.get('node_count', 0)} 个 | 剩余流量: {remain_str}"
             msg_text = (
                 "🔒 <b>私密分享</b>\n\n"
                 f"👤 来自: {html.escape(user_name)}\n"
@@ -2473,11 +2604,120 @@ def build_app() -> Application:
     return app
 
 
+async def check_and_notify_alerts(
+    bot: Any,
+    user_id: int,
+    subs: list[dict[str, Any]] | None = None,
+    *,
+    cooldown_seconds: int = 86400,
+) -> list[str]:
+    """检查用户订阅的临期与低流量状态，24h 内同一订阅同一告警只推送一次。"""
+    if subs is None:
+        subs = await store.list_subs_meta(user_id)
+    now = int(time.time())
+    alerts: list[str] = []
+    expire_threshold = max(1, int(config.ALERT_EXPIRE_DAYS)) * 86400
+    traffic_threshold = float(max(1, int(config.ALERT_TRAFFIC_GB)))
+
+    for sub in subs:
+        sub_id = int(sub["id"])
+        name = html.escape(str(sub.get("name") or "未命名"))
+        exp = sub.get("expire_at")
+        if exp is not None and 0 < int(exp) - now <= expire_threshold:
+            key = f"alert_exp:{user_id}:{sub_id}"
+            last_sent = int(await store.get_meta(key) or "0")
+            if now - last_sent >= cooldown_seconds:
+                days_left = max(0, (int(exp) - now) // 86400)
+                hours_left = max(0, ((int(exp) - now) % 86400) // 3600)
+                alerts.append(f"⏳ <b>{name}</b> 即将到期（剩余 {days_left}天{hours_left}小时）")
+                await store.set_meta(key, str(now))
+
+        remain = remain_traffic_gb(sub)
+        total = sub.get("traffic_total")
+        if total is not None and float(total) > 0 and remain is not None and 0 < remain <= traffic_threshold:
+            key = f"alert_trf:{user_id}:{sub_id}"
+            last_sent = int(await store.get_meta(key) or "0")
+            if now - last_sent >= cooldown_seconds:
+                alerts.append(f"📉 <b>{name}</b> 剩余流量不足（仅剩 {remain:.2f} GB）")
+                await store.set_meta(key, str(now))
+
+    if alerts and bot is not None:
+        msg = (
+            "🔔 <b>订阅巡检提醒</b>\n\n"
+            + "\n".join(f"• {a}" for a in alerts)
+            + "\n\n<i>发送 /list 或 /expire 查看详情。</i>"
+        )
+        with suppress(Exception):
+            await bot.send_message(
+                chat_id=user_id,
+                text=msg,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+    return alerts
+
+
+async def run_scheduled_maintenance(bot: Any = None) -> dict[str, int]:
+    """后台定时巡检：清理过期数据、并发刷新活跃用户的网络订阅并推送临期/低流量提醒。"""
+    cleaned = await store.cleanup_expired()
+    user_ids = await store.list_active_user_ids()
+    sem = asyncio.Semaphore(max(1, UPDATE_CONCURRENCY))
+    refreshed_count = 0
+    alert_count = 0
+
+    for uid in user_ids:
+        if not await allowed(uid):
+            continue
+        subs = await store.list_subs_meta(uid)
+        remote_subs = [s for s in subs if not str(s.get("url") or "").startswith("uploaded://")]
+
+        async def _refresh_item(s: dict[str, Any]) -> dict[str, Any]:
+            async with sem:
+                try:
+                    return await refresh_sub(uid, s, rename=True, meta_only=True)
+                except Exception as exc:
+                    log.warning("scheduled refresh failed for sub #%s: %s", s.get("id"), exc)
+                    return s
+
+        if remote_subs:
+            await asyncio.gather(*(_refresh_item(s) for s in remote_subs))
+            refreshed_count += len(remote_subs)
+
+        latest_subs = await store.list_subs_meta(uid)
+        triggered = await check_and_notify_alerts(bot, uid, latest_subs)
+        alert_count += len(triggered)
+
+    return {
+        "cleaned_shares": cleaned.get("shares", 0),
+        "cleaned_deleted": cleaned.get("deleted_subs", 0),
+        "refreshed_subs": refreshed_count,
+        "alerts_sent": alert_count,
+    }
+
+
+async def _maintenance_loop(bot: Any) -> None:
+    """后台定时任务循环。每小时清理一次过期分享/回收站，按 AUTO_REFRESH_HOURS 周期巡检订阅。"""
+    last_refresh_ts = time.monotonic()
+    while True:
+        await asyncio.sleep(3600)
+        with suppress(Exception):
+            await store.cleanup_expired()
+        hours = int(config.AUTO_REFRESH_HOURS)
+        if hours > 0 and (time.monotonic() - last_refresh_ts) >= hours * 3600:
+            last_refresh_ts = time.monotonic()
+            try:
+                stats = await run_scheduled_maintenance(bot)
+                log.info("Scheduled maintenance completed: %s", stats)
+            except Exception as exc:
+                log.warning("Scheduled maintenance failed: %s", exc)
+
+
 async def amain() -> None:
     app = build_app()
     # 先把建表/迁移一次性做完，之后所有查询共享同一条连接
     await store.init()
     runner = await start_http(app)
+    maint_task: asyncio.Task[None] | None = None
     try:
         log.info("Bot starting...")
         await app.initialize()
@@ -2493,10 +2733,15 @@ async def amain() -> None:
             log.warning("Failed to calibrate bot username from API: %s", e)
 
         await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+        maint_task = asyncio.create_task(_maintenance_loop(app.bot))
         # run forever
         while True:
             await asyncio.sleep(3600)
     finally:
+        if maint_task is not None:
+            maint_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await maint_task
         with suppress(Exception):
             await app.updater.stop()
         with suppress(Exception):

@@ -8,7 +8,7 @@ import re
 import socket
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse
 
 MAX_SUBSCRIPTION_REDIRECTS = 5
 MAX_SUBSCRIPTION_BYTES = 10 * 1024 * 1024
@@ -659,12 +659,263 @@ def apply_path_maps(nodes: list[dict[str, Any]], maps: dict[str, str]) -> list[d
     return out
 
 
+def _resolve_temp_node(node: dict[str, Any]) -> dict[str, Any]:
+    """将只有 share 链接的临时节点尽力解析为结构化节点，保留自定义名称。"""
+    if node.get("type") != "temp" or node.get("server"):
+        return node
+    share = str(node.get("share") or "").strip()
+    if not share:
+        return node
+    parsed = parse_share_link(share)
+    if not parsed:
+        return node
+    merged = dict(parsed)
+    if node.get("name"):
+        merged["name"] = str(node["name"])
+    merged["share"] = share
+    return merged
+
+
+def node_to_share_link(node: dict[str, Any]) -> str:
+    """将节点转换为分享链接；若已有原始 share 则优先返回，否则从 YAML/JSON 结构化字段逆向生成。"""
+    share = str(node.get("share") or "").strip()
+    if share:
+        return share
+    n = _resolve_temp_node(node)
+    share = str(n.get("share") or "").strip()
+    if share:
+        return share
+
+    typ = str(n.get("type") or "").lower()
+    if typ == "shadowsocks":
+        typ = "ss"
+    elif typ == "hy2":
+        typ = "hysteria2"
+
+    server = str(n.get("server") or "").strip()
+    port = int(n.get("port") or n.get("server_port") or 0)
+    if not server or port <= 0:
+        return ""
+    name = str(n.get("name") or f"{typ.upper()} 节点").strip()
+    frag = quote(name, safe="")
+    host_part = f"[{server}]" if ":" in server and not server.startswith("[") else server
+
+    tls_raw = n.get("tls")
+    tls_dict = tls_raw if isinstance(tls_raw, dict) else {}
+    tls_enabled = bool(tls_dict.get("enabled")) if tls_dict else bool(tls_raw)
+    sni = str(
+        n.get("sni")
+        or n.get("servername")
+        or tls_dict.get("server_name")
+        or ""
+    ).strip()
+    insecure = bool(
+        n.get("skip-cert-verify")
+        or tls_dict.get("insecure")
+    )
+
+    transport = n.get("transport") if isinstance(n.get("transport"), dict) else {}
+    network = str(n.get("network") or transport.get("type") or "tcp").lower()
+    ws_opts = n.get("ws-opts") if isinstance(n.get("ws-opts"), dict) else {}
+    grpc_opts = n.get("grpc-opts") if isinstance(n.get("grpc-opts"), dict) else {}
+    ws_path = str(ws_opts.get("path") or transport.get("path") or "").strip()
+    ws_headers = ws_opts.get("headers") if isinstance(ws_opts.get("headers"), dict) else (
+        transport.get("headers") if isinstance(transport.get("headers"), dict) else {}
+    )
+    ws_host = str(ws_headers.get("Host") or ws_headers.get("host") or "").strip()
+    grpc_service = str(
+        grpc_opts.get("grpc-service-name") or transport.get("service_name") or ""
+    ).strip()
+
+    if typ == "ss":
+        cipher = str(n.get("cipher") or n.get("method") or "aes-256-gcm").strip()
+        password = str(n.get("password") or "")
+        userinfo = base64.urlsafe_b64encode(f"{cipher}:{password}".encode("utf-8")).decode("ascii").rstrip("=")
+        return f"ss://{userinfo}@{host_part}:{port}#{frag}"
+
+    if typ == "vmess":
+        uuid = str(n.get("uuid") or "").strip()
+        if not uuid:
+            return ""
+        payload = {
+            "v": "2",
+            "ps": name,
+            "add": server,
+            "port": port,
+            "id": uuid,
+            "aid": int(n.get("alterId") or n.get("alter_id") or 0),
+            "scy": str(n.get("cipher") or n.get("security") or "auto"),
+            "net": network or "tcp",
+            "type": "none",
+            "host": ws_host or sni,
+            "path": ws_path or grpc_service,
+            "tls": "tls" if tls_enabled else "",
+            "sni": sni,
+        }
+        b64 = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
+        return f"vmess://{b64}"
+
+    if typ == "vless":
+        uuid = str(n.get("uuid") or "").strip()
+        if not uuid:
+            return ""
+        reality = n.get("reality-opts") if isinstance(n.get("reality-opts"), dict) else (
+            tls_dict.get("reality") if isinstance(tls_dict.get("reality"), dict) else {}
+        )
+        pbk = str(reality.get("public-key") or reality.get("public_key") or "").strip()
+        sid = str(reality.get("short-id") or reality.get("short_id") or "").strip()
+        params: dict[str, str] = {"encryption": "none"}
+        if pbk:
+            params["security"] = "reality"
+            params["pbk"] = pbk
+            if sid:
+                params["sid"] = sid
+        elif tls_enabled:
+            params["security"] = "tls"
+        if sni:
+            params["sni"] = sni
+        if network and network != "tcp":
+            params["type"] = network
+        if ws_path:
+            params["path"] = ws_path
+        if ws_host:
+            params["host"] = ws_host
+        if grpc_service:
+            params["serviceName"] = grpc_service
+        flow = str(n.get("flow") or "").strip()
+        if flow:
+            params["flow"] = flow
+        fp = str(
+            n.get("client-fingerprint")
+            or (tls_dict.get("utls") or {}).get("fingerprint", "")
+            or ""
+        ).strip()
+        if fp:
+            params["fp"] = fp
+        if insecure:
+            params["allowInsecure"] = "1"
+        return f"vless://{quote(uuid, safe='')}@{host_part}:{port}?{urlencode(params)}#{frag}"
+
+    if typ == "trojan":
+        password = str(n.get("password") or "")
+        params = {}
+        if sni:
+            params["sni"] = sni
+        if insecure:
+            params["allowInsecure"] = "1"
+        if network and network != "tcp":
+            params["type"] = network
+        if ws_path:
+            params["path"] = ws_path
+        if ws_host:
+            params["host"] = ws_host
+        if grpc_service:
+            params["serviceName"] = grpc_service
+        qs = f"?{urlencode(params)}" if params else ""
+        return f"trojan://{quote(password, safe='')}@{host_part}:{port}{qs}#{frag}"
+
+    if typ == "hysteria2":
+        password = str(n.get("password") or "")
+        params = {}
+        if sni:
+            params["sni"] = sni
+        if insecure:
+            params["insecure"] = "1"
+        obfs = str(n.get("obfs") or "").strip()
+        if obfs:
+            params["obfs"] = obfs
+            if n.get("obfs-password"):
+                params["obfs-password"] = str(n["obfs-password"])
+        qs = f"?{urlencode(params)}" if params else ""
+        return f"hysteria2://{quote(password, safe='')}@{host_part}:{port}{qs}#{frag}"
+
+    if typ == "tuic":
+        uuid = str(n.get("uuid") or "").strip()
+        password = str(n.get("password") or uuid)
+        params = {}
+        if sni:
+            params["sni"] = sni
+        if insecure:
+            params["allow_insecure"] = "1"
+        udp_mode = str(n.get("udp-relay-mode") or n.get("udp_relay_mode") or "").strip()
+        if udp_mode:
+            params["udp_relay_mode"] = udp_mode
+        cc = str(n.get("congestion-controller") or n.get("congestion_control") or "").strip()
+        if cc:
+            params["congestion_control"] = cc
+        qs = f"?{urlencode(params)}" if params else ""
+        return f"tuic://{quote(uuid, safe='')}:{quote(password, safe='')}@{host_part}:{port}{qs}#{frag}"
+
+    return ""
+
+
+def deduplicate_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按协议+服务器+端口+凭据+传输参数去重节点，保持原始顺序。"""
+    seen: set[tuple[Any, ...]] = set()
+    out: list[dict[str, Any]] = []
+    for raw in nodes:
+        n = _resolve_temp_node(raw)
+        typ = str(n.get("type") or "").lower()
+        if typ == "shadowsocks":
+            typ = "ss"
+        elif typ == "hy2":
+            typ = "hysteria2"
+        server = str(n.get("server") or "").strip().lower()
+        port = int(n.get("port") or n.get("server_port") or 0)
+        cred = str(n.get("uuid") or n.get("password") or "")
+        ws_opts = n.get("ws-opts") if isinstance(n.get("ws-opts"), dict) else {}
+        transport = n.get("transport") if isinstance(n.get("transport"), dict) else {}
+        path = str(ws_opts.get("path") or transport.get("path") or "")
+        if server and port > 0:
+            key: tuple[Any, ...] = (typ, server, port, cred, path)
+        else:
+            share = str(n.get("share") or n.get("name") or id(n))
+            key = (typ, share)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(raw)
+    return out
+
+
+def format_subscription_userinfo(subs: list[dict[str, Any]] | dict[str, Any]) -> str | None:
+    """构造标准 subscription-userinfo 响应头，供 Clash / Shadowrocket / Sing-box 显示流量与到期时间。"""
+    items = [subs] if isinstance(subs, dict) else list(subs)
+    total_gb = 0.0
+    used_gb = 0.0
+    has_traffic = False
+    expires: list[int] = []
+
+    for sub in items:
+        t_total = sub.get("traffic_total")
+        t_used = sub.get("traffic_used")
+        if t_total is not None and float(t_total) > 0:
+            has_traffic = True
+            total_gb += float(t_total)
+            used_gb += max(0.0, float(t_used or 0.0))
+        exp = sub.get("expire_at")
+        if exp is not None and int(exp) > 0:
+            expires.append(int(exp))
+
+    if not has_traffic and not expires:
+        return None
+
+    parts: list[str] = []
+    if has_traffic:
+        used_bytes = int(round(used_gb * (1024 ** 3)))
+        total_bytes = int(round(total_gb * (1024 ** 3)))
+        parts.extend([f"upload=0", f"download={used_bytes}", f"total={total_bytes}"])
+    if expires:
+        parts.append(f"expire={min(expires)}")
+    return "; ".join(parts)
+
+
 def to_share_links(nodes: list[dict[str, Any]]) -> list[str]:
     links = []
     for n in nodes:
-        share = n.get("share")
-        if share:
-            links.append(str(share))
+        link = node_to_share_link(n)
+        if link:
+            links.append(link)
     return links
 
 
@@ -674,16 +925,84 @@ def to_base64_sub(nodes: list[dict[str, Any]]) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
+def _unique_node_name(base: str, used: set[str]) -> str:
+    name = base or "node"
+    if name not in used:
+        used.add(name)
+        return name
+    idx = 2
+    while f"{name} #{idx}" in used:
+        idx += 1
+    candidate = f"{name} #{idx}"
+    used.add(candidate)
+    return candidate
+
+
+def _normalize_for_clash(raw_node: dict[str, Any]) -> dict[str, Any] | None:
+    n = _resolve_temp_node(raw_node)
+    item = {k: v for k, v in n.items() if k not in ("share", "raw") and v not in ("", None)}
+    if "name" not in item:
+        return None
+    typ = str(item.get("type") or "").lower()
+    if typ in ("", "unknown", "temp") and not item.get("server"):
+        return None
+    if typ == "shadowsocks":
+        item["type"] = "ss"
+    elif typ == "hy2":
+        item["type"] = "hysteria2"
+
+    # 兼容来自 sing-box outbounds 的字段
+    if "server_port" in item:
+        port_val = item.pop("server_port")
+        item.setdefault("port", port_val)
+    if "method" in item and item.get("type") == "ss":
+        method_val = item.pop("method")
+        item.setdefault("cipher", method_val)
+    if "alter_id" in item and item.get("type") == "vmess":
+        aid_val = item.pop("alter_id")
+        item.setdefault("alterId", aid_val)
+    if "security" in item and item.get("type") == "vmess":
+        sec_val = item.pop("security")
+        item.setdefault("cipher", sec_val)
+    if isinstance(item.get("tls"), dict):
+        tls_dict = item.pop("tls")
+        item["tls"] = bool(tls_dict.get("enabled", True))
+        if tls_dict.get("server_name"):
+            key_name = "sni" if item.get("type") in ("trojan", "hysteria2", "tuic") else "servername"
+            item.setdefault(key_name, tls_dict["server_name"])
+        if "insecure" in tls_dict:
+            item.setdefault("skip-cert-verify", bool(tls_dict["insecure"]))
+        if tls_dict.get("alpn"):
+            item.setdefault("alpn", tls_dict["alpn"])
+    if isinstance(item.get("transport"), dict):
+        tr = item.pop("transport")
+        tr_type = tr.get("type")
+        if tr_type:
+            item.setdefault("network", tr_type)
+        if tr_type == "ws":
+            ws_opts: dict[str, Any] = {}
+            if tr.get("path"):
+                ws_opts["path"] = tr["path"]
+            if tr.get("headers"):
+                ws_opts["headers"] = tr["headers"]
+            if ws_opts:
+                item.setdefault("ws-opts", ws_opts)
+        elif tr_type == "grpc" and tr.get("service_name"):
+            item.setdefault("grpc-opts", {"grpc-service-name": tr["service_name"]})
+    if not item.get("server"):
+        return None
+    return item
+
+
 def to_clash(nodes: list[dict[str, Any]]) -> str:
     proxies = []
     names = []
+    used_names: set[str] = set()
     for n in nodes:
-        item = {k: v for k, v in n.items() if k not in ("share", "raw") and v not in ("", None)}
-        if "name" not in item:
+        item = _normalize_for_clash(n)
+        if not item:
             continue
-        # minimal required
-        if item.get("type") in (None, "unknown") and not item.get("server"):
-            continue
+        item["name"] = _unique_node_name(str(item["name"]), used_names)
         proxies.append(item)
         names.append(item["name"])
     data = {
@@ -700,30 +1019,64 @@ def to_clash(nodes: list[dict[str, Any]]) -> str:
 def to_surge(nodes: list[dict[str, Any]]) -> str:
     lines = ["[Proxy]"]
     names = []
-    for n in nodes:
-        name = str(n.get("name") or "node")
-        names.append(name)
-        typ = str(n.get("type") or "")
+    used_names: set[str] = set()
+    for raw in nodes:
+        n = _resolve_temp_node(raw)
+        name = _unique_node_name(str(n.get("name") or "node"), used_names)
+        typ = str(n.get("type") or "").lower()
+        if typ == "shadowsocks":
+            typ = "ss"
+        elif typ == "hy2":
+            typ = "hysteria2"
         server = n.get("server") or ""
-        port = n.get("port") or ""
-        if typ == "ss":
+        port = n.get("port") or n.get("server_port") or ""
+        if typ == "ss" and server and port:
+            names.append(name)
+            cipher = n.get("cipher") or n.get("method") or "aes-256-gcm"
             lines.append(
-                f"{name} = ss, {server}, {port}, encrypt-method={n.get('cipher') or 'aes-256-gcm'}, password={n.get('password') or ''}"
+                f"{name} = ss, {server}, {port}, encrypt-method={cipher}, password={n.get('password') or ''}"
             )
-        elif typ == "trojan":
+        elif typ == "trojan" and server and port:
+            names.append(name)
+            sni = n.get("sni") or n.get("servername") or server
+            skip = ", skip-cert-verify=true" if n.get("skip-cert-verify") else ""
             lines.append(
-                f"{name} = trojan, {server}, {port}, password={n.get('password') or ''}, sni={n.get('sni') or server}"
+                f"{name} = trojan, {server}, {port}, password={n.get('password') or ''}, sni={sni}{skip}"
             )
-        elif typ == "vmess":
+        elif typ == "vmess" and server and port:
+            names.append(name)
+            tls_val = n.get("tls")
+            tls_on = tls_val.get("enabled") if isinstance(tls_val, dict) else bool(tls_val)
+            ws_extra = ""
+            ws_opts = n.get("ws-opts") if isinstance(n.get("ws-opts"), dict) else {}
+            if n.get("network") == "ws" or ws_opts:
+                ws_path = ws_opts.get("path") or "/"
+                ws_extra = f", ws=true, ws-path={ws_path}"
             lines.append(
-                f"{name} = vmess, {server}, {port}, username={n.get('uuid') or ''}, tls={'true' if n.get('tls') else 'false'}"
+                f"{name} = vmess, {server}, {port}, username={n.get('uuid') or ''}, tls={'true' if tls_on else 'false'}{ws_extra}"
             )
-        elif typ == "vless":
+        elif typ == "vless" and server and port:
+            names.append(name)
+            tls_val = n.get("tls")
+            tls_on = tls_val.get("enabled") if isinstance(tls_val, dict) else bool(tls_val)
             lines.append(
-                f"{name} = vless, {server}, {port}, username={n.get('uuid') or ''}, tls={'true' if n.get('tls') else 'false'}"
+                f"{name} = vless, {server}, {port}, username={n.get('uuid') or ''}, tls={'true' if tls_on else 'false'}"
+            )
+        elif typ == "hysteria2" and server and port:
+            names.append(name)
+            sni = n.get("sni") or n.get("servername") or server
+            skip = ", skip-cert-verify=true" if n.get("skip-cert-verify") else ""
+            lines.append(
+                f"{name} = hysteria2, {server}, {port}, password={n.get('password') or ''}, sni={sni}{skip}"
+            )
+        elif typ == "tuic" and server and port:
+            names.append(name)
+            sni = n.get("sni") or n.get("servername") or server
+            lines.append(
+                f"{name} = tuic, {server}, {port}, token={n.get('password') or ''}, uuid={n.get('uuid') or ''}, sni={sni}"
             )
         else:
-            share = n.get("share")
+            share = node_to_share_link(n)
             if share:
                 lines.append(f"# {name}: {share}")
     lines += ["", "[Proxy Group]", f"Proxy = select, {', '.join(names) if names else 'DIRECT'}", "", "[Rule]", "FINAL,Proxy"]
@@ -732,47 +1085,143 @@ def to_surge(nodes: list[dict[str, Any]]) -> str:
 
 def to_qx(nodes: list[dict[str, Any]]) -> str:
     lines = []
-    for n in nodes:
+    for raw in nodes:
+        n = _resolve_temp_node(raw)
         share = n.get("share")
         if share:
             lines.append(str(share))
             continue
         name = str(n.get("name") or "node")
-        typ = str(n.get("type") or "")
+        typ = str(n.get("type") or "").lower()
+        if typ == "shadowsocks":
+            typ = "ss"
         server = n.get("server") or ""
-        port = n.get("port") or ""
-        if typ == "ss":
+        port = n.get("port") or n.get("server_port") or ""
+        if typ == "ss" and server and port:
+            cipher = n.get("cipher") or n.get("method") or "aes-256-gcm"
             lines.append(
-                f"shadowsocks={server}:{port}, method={n.get('cipher') or 'aes-256-gcm'}, password={n.get('password') or ''}, tag={name}"
+                f"shadowsocks={server}:{port}, method={cipher}, password={n.get('password') or ''}, tag={name}"
             )
-        elif typ == "trojan":
+        elif typ == "trojan" and server and port:
+            sni = n.get("sni") or n.get("servername") or server
             lines.append(
-                f"trojan={server}:{port}, password={n.get('password') or ''}, over-tls=true, tls-host={n.get('sni') or server}, tag={name}"
+                f"trojan={server}:{port}, password={n.get('password') or ''}, over-tls=true, tls-host={sni}, tag={name}"
             )
-        elif typ == "vmess":
+        elif typ == "vmess" and server and port:
             lines.append(
                 f"vmess={server}:{port}, method=chacha20-ietf-poly1305, password={n.get('uuid') or ''}, tag={name}"
             )
+        else:
+            synthesized = node_to_share_link(n)
+            if synthesized:
+                lines.append(synthesized)
     return "\n".join(lines) + ("\n" if lines else "")
 
 
 def to_singbox(nodes: list[dict[str, Any]]) -> str:
     outbounds = []
     tags = []
-    for n in nodes:
-        tag = str(n.get("name") or "node")
-        typ = n.get("type") or "unknown"
-        ob: dict[str, Any] = {"tag": tag, "type": typ}
-        for k in ("server", "server_port", "port", "uuid", "password", "flow", "tls", "transport"):
-            if k in n:
-                ob[k if k != "port" else "server_port"] = n[k]
-        if "port" in n and "server_port" not in ob:
-            ob["server_port"] = n["port"]
+    used_tags: set[str] = set()
+    for raw in nodes:
+        n = _resolve_temp_node(raw)
+        server = n.get("server")
+        port = n.get("server_port") or n.get("port")
+        if not server or not port:
+            continue
+        tag = _unique_node_name(str(n.get("name") or "node"), used_tags)
+        typ = str(n.get("type") or "unknown").lower()
+        if typ == "ss":
+            typ = "shadowsocks"
+        elif typ == "hy2":
+            typ = "hysteria2"
+
+        ob: dict[str, Any] = {
+            "tag": tag,
+            "type": typ,
+            "server": str(server),
+            "server_port": int(port),
+        }
+
+        if typ == "shadowsocks":
+            ob["method"] = str(n.get("method") or n.get("cipher") or "aes-256-gcm")
+            ob["password"] = str(n.get("password") or "")
+        elif typ == "vmess":
+            if n.get("uuid"):
+                ob["uuid"] = str(n["uuid"])
+            ob["security"] = str(n.get("security") or n.get("cipher") or "auto")
+            ob["alter_id"] = int(n.get("alter_id") or n.get("alterId") or 0)
+        elif typ == "vless":
+            if n.get("uuid"):
+                ob["uuid"] = str(n["uuid"])
+            if n.get("flow"):
+                ob["flow"] = str(n["flow"])
+        elif typ in ("trojan", "hysteria2"):
+            if n.get("password") is not None:
+                ob["password"] = str(n["password"])
+        elif typ == "tuic":
+            if n.get("uuid"):
+                ob["uuid"] = str(n["uuid"])
+            if n.get("password") is not None:
+                ob["password"] = str(n["password"])
+            if n.get("congestion-controller") or n.get("congestion_control"):
+                ob["congestion_control"] = str(n.get("congestion-controller") or n.get("congestion_control"))
+            if n.get("udp-relay-mode") or n.get("udp_relay_mode"):
+                ob["udp_relay_mode"] = str(n.get("udp-relay-mode") or n.get("udp_relay_mode"))
+        else:
+            for k in ("uuid", "password", "flow"):
+                if n.get(k):
+                    ob[k] = n[k]
+
+        # TLS 配置映射
+        raw_tls = n.get("tls")
+        if isinstance(raw_tls, dict):
+            ob["tls"] = dict(raw_tls)
+        elif raw_tls is True or typ in ("trojan", "hysteria2", "tuic") or isinstance(n.get("reality-opts"), dict):
+            tls_obj: dict[str, Any] = {"enabled": True}
+            sni = str(n.get("sni") or n.get("servername") or server or "").strip()
+            if sni:
+                tls_obj["server_name"] = sni
+            if n.get("skip-cert-verify") is not None:
+                tls_obj["insecure"] = bool(n["skip-cert-verify"])
+            if isinstance(n.get("alpn"), list) and n["alpn"]:
+                tls_obj["alpn"] = list(n["alpn"])
+            if n.get("client-fingerprint"):
+                tls_obj["utls"] = {"enabled": True, "fingerprint": str(n["client-fingerprint"])}
+            if isinstance(n.get("reality-opts"), dict):
+                ro = n["reality-opts"]
+                tls_obj["reality"] = {
+                    "enabled": True,
+                    "public_key": str(ro.get("public-key") or ro.get("public_key") or ""),
+                    "short_id": str(ro.get("short-id") or ro.get("short_id") or ""),
+                }
+            ob["tls"] = tls_obj
+
+        # Transport 传输层映射
+        if isinstance(n.get("transport"), dict):
+            ob["transport"] = dict(n["transport"])
+        else:
+            net = str(n.get("network") or "").lower()
+            if net == "ws":
+                ws_opts = n.get("ws-opts") if isinstance(n.get("ws-opts"), dict) else {}
+                tr: dict[str, Any] = {"type": "ws"}
+                if ws_opts.get("path"):
+                    tr["path"] = ws_opts["path"]
+                if ws_opts.get("headers"):
+                    tr["headers"] = ws_opts["headers"]
+                ob["transport"] = tr
+            elif net == "grpc":
+                grpc_opts = n.get("grpc-opts") if isinstance(n.get("grpc-opts"), dict) else {}
+                tr = {"type": "grpc"}
+                if grpc_opts.get("grpc-service-name"):
+                    tr["service_name"] = grpc_opts["grpc-service-name"]
+                ob["transport"] = tr
+
         outbounds.append(ob)
         tags.append(tag)
     data = {
         "outbounds": [
-            {"type": "selector", "tag": "proxy", "outbounds": tags or ["direct"]},
+            {"type": "selector", "tag": "proxy", "outbounds": ["auto", *tags] if tags else ["direct"]},
+            {"type": "urltest", "tag": "auto", "outbounds": tags or ["direct"], "url": "http://www.gstatic.com/generate_204", "interval": "5m"},
             {"type": "direct", "tag": "direct"},
             *outbounds,
         ]

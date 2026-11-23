@@ -92,6 +92,11 @@ MAX_IMPORTED_NODES = _env_int("MAX_IMPORTED_NODES", 500, 1, 5000)
 MAX_IMPORTED_SUBSCRIPTIONS = _env_int("MAX_IMPORTED_SUBSCRIPTIONS", 20, 1, 100)
 # 批量更新订阅的并发上限。太高会让机场把并发请求当刷探测，8 是实测稳妥值。
 UPDATE_CONCURRENCY = _env_int("UPDATE_CONCURRENCY", 8, 1, 32)
+# 定时自动巡检刷新间隔（小时），设为 0 关闭后台自动巡检。
+AUTO_REFRESH_HOURS = _env_int("AUTO_REFRESH_HOURS", 6, 0, 168)
+# 主动提醒阈值：剩余天数 <= ALERT_EXPIRE_DAYS 或剩余流量 <= ALERT_TRAFFIC_GB 时私聊推送提醒。
+ALERT_EXPIRE_DAYS = _env_int("ALERT_EXPIRE_DAYS", 3, 1, 30)
+ALERT_TRAFFIC_GB = _env_int("ALERT_TRAFFIC_GB", 5, 1, 100)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 try:
     DATA_DIR.chmod(0o700)

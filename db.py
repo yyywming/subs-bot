@@ -115,6 +115,13 @@ CREATE TABLE IF NOT EXISTS auth_overrides (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id, id);
+CREATE INDEX IF NOT EXISTS idx_deleted_subs_user_deleted ON deleted_subs(user_id, deleted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_path_maps_user_id ON path_maps(user_id, id);
+CREATE INDEX IF NOT EXISTS idx_temp_nodes_user_id ON temp_nodes(user_id, id);
+CREATE INDEX IF NOT EXISTS idx_short_links_user_target ON short_links(user_id, target_url);
+CREATE INDEX IF NOT EXISTS idx_shares_expire_at ON shares(expire_at);
+CREATE INDEX IF NOT EXISTS idx_share_claims_code ON share_claims(share_code);
 """
 
 
@@ -181,17 +188,49 @@ class Store:
         self._conn = db
         self._ready = True
 
-    async def _cleanup_expired(self, db: aiosqlite.Connection) -> None:
+    async def _cleanup_expired(self, db: aiosqlite.Connection) -> dict[str, int]:
         """删除已不可用的历史记录；不改变仍在有效期内的功能数据。"""
         now = int(time.time())
-        await db.execute("DELETE FROM shares WHERE expire_at < ?", (now,))
-        await db.execute(
+        c1 = await db.execute("DELETE FROM shares WHERE expire_at < ?", (now,))
+        c2 = await db.execute(
             "DELETE FROM share_claims WHERE share_code NOT IN (SELECT code FROM shares)"
         )
-        await db.execute(
+        c3 = await db.execute(
             "DELETE FROM deleted_subs WHERE deleted_at < ?", (now - 30 * 86400,)
         )
         await db.commit()
+        return {
+            "shares": max(0, int(c1.rowcount or 0)),
+            "share_claims": max(0, int(c2.rowcount or 0)),
+            "deleted_subs": max(0, int(c3.rowcount or 0)),
+        }
+
+    async def cleanup_expired(self) -> dict[str, int]:
+        """公开的过期数据清理入口，供后台定时巡检调用。"""
+        async with self.connection() as db:
+            return await self._cleanup_expired(db)
+
+    async def get_meta(self, key: str) -> str | None:
+        async with self.connection() as db:
+            cur = await db.execute("SELECT value FROM meta WHERE key=?", (key,))
+            row = await cur.fetchone()
+            return str(row["value"]) if row else None
+
+    async def set_meta(self, key: str, value: str) -> None:
+        async with self.connection() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                (str(key), str(value)),
+            )
+            await db.commit()
+
+    async def list_active_user_ids(self) -> list[int]:
+        """返回所有拥有个人订阅的正数用户 ID（不含历史负群 ID）。"""
+        async with self.connection() as db:
+            cur = await db.execute(
+                "SELECT DISTINCT user_id FROM subscriptions WHERE user_id > 0 ORDER BY user_id ASC"
+            )
+            return [int(row["user_id"]) for row in await cur.fetchall()]
 
     async def _backfill_node_count(self, db: aiosqlite.Connection) -> None:
         """给历史数据回填 node_count。只跑一次，靠 meta 表记标记位。
@@ -515,8 +554,16 @@ class Store:
             return cur.rowcount
 
     async def create_short(self, user_id: int, target_url: str) -> str:
-        code = secrets.token_urlsafe(9)
+        """创建或复用同一用户同一目标 URL 的短链码，避免重复点击无限膨胀 short_links 表。"""
         async with self.connection() as db:
+            cur = await db.execute(
+                "SELECT code FROM short_links WHERE user_id=? AND target_url=? ORDER BY created_at DESC LIMIT 1",
+                (user_id, target_url),
+            )
+            row = await cur.fetchone()
+            if row and row["code"]:
+                return str(row["code"])
+            code = secrets.token_urlsafe(9)
             await db.execute(
                 "INSERT INTO short_links(code,user_id,target_url,created_at) VALUES(?,?,?,?)",
                 (code, user_id, target_url, int(time.time())),
@@ -530,6 +577,20 @@ class Store:
             row = await cur.fetchone()
             return dict(row) if row else None
 
+    async def purge_unsent_share_drafts(self, sender_id: int, within_seconds: int = 3) -> int:
+        """清理同一发送者在极短时间内（如内联输入逐字敲击时）产生但尚未发出的草稿分享。"""
+        _require_tg_user_id(sender_id)
+        cutoff = int(time.time()) - max(1, within_seconds)
+        async with self.connection() as db:
+            cur = await db.execute(
+                """DELETE FROM shares
+                   WHERE sender_id=? AND claimed_count=0
+                     AND inline_message_id IS NULL AND created_at>=?""",
+                (sender_id, cutoff),
+            )
+            await db.commit()
+            return max(0, int(cur.rowcount or 0))
+
     async def create_share(
         self,
         sender_id: int,
@@ -542,10 +603,28 @@ class Store:
         _require_tg_user_id(sender_id)
         if target_user_id is not None:
             _require_tg_user_id(target_user_id)
-        code = secrets.token_urlsafe(8)
         now = int(time.time())
         expire_at = now + max(1, duration_minutes) * 60
         async with self.connection() as db:
+            cur = await db.execute(
+                """SELECT code FROM shares
+                   WHERE sender_id=? AND content=? AND max_views=?
+                     AND COALESCE(target_user_id, 0)=COALESCE(?, 0)
+                     AND claimed_count=0 AND inline_message_id IS NULL
+                     AND expire_at>?
+                   ORDER BY created_at DESC LIMIT 1""",
+                (sender_id, content, max_views, target_user_id, now),
+            )
+            existing = await cur.fetchone()
+            if existing and existing["code"]:
+                code = str(existing["code"])
+                await db.execute(
+                    "UPDATE shares SET sender_name=?, expire_at=? WHERE code=?",
+                    (sender_name, expire_at, code),
+                )
+                await db.commit()
+                return code
+            code = secrets.token_urlsafe(8)
             await db.execute(
                 """INSERT INTO shares
                 (code, sender_id, sender_name, content, max_views, claimed_count, target_user_id, expire_at, created_at)
