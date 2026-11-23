@@ -23,7 +23,7 @@ from telegram import (
     InlineQueryResultsButton,
     InputTextMessageContent,
     LinkPreviewOptions,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     InputFile,
     Update,
 )
@@ -202,15 +202,48 @@ def is_valid_http_url(url: str, max_len: int = 2048) -> bool:
         return False
 
 
-MAIN_KB = ReplyKeyboardMarkup(
+# 主菜单采用贴合消息气泡底部的两列对称内联键盘（避免底部 ReplyKeyboard 占满输入区）。
+HOME_INLINE_KB = InlineKeyboardMarkup([
     [
-        ["📦 订阅列表", "🟠 临期列表"],
-        ["📤 导出链接", "🔄 更新所有"],
-        ["🔢 重置编号", "♻️ 撤销删除", "🧪 临时节点"],
-        ["🧭 路径对应", "❓ 帮助菜单"],
+        InlineKeyboardButton("📦 订阅列表", callback_data="menu:list"),
+        InlineKeyboardButton("🟠 临期列表", callback_data="menu:expire"),
     ],
-    resize_keyboard=True,
-)
+    [
+        InlineKeyboardButton("📤 导出链接", callback_data="menu:export"),
+        InlineKeyboardButton("🔄 更新所有", callback_data="menu:updateall"),
+    ],
+    [
+        InlineKeyboardButton("🔢 重置编号", callback_data="menu:renumber"),
+        InlineKeyboardButton("♻️ 撤销删除", callback_data="menu:recycle"),
+    ],
+    [
+        InlineKeyboardButton("🧭 路径对应", callback_data="menu:path"),
+        InlineKeyboardButton("🧪 临时节点", callback_data="menu:temp"),
+    ],
+    [
+        InlineKeyboardButton("🤖 API 测试", callback_data="menu:ai"),
+        InlineKeyboardButton("❓ 帮助菜单", callback_data="menu:help"),
+    ],
+])
+
+# 普通回执与提示消息附带轻量单行内联导航，不再弹出底部 ReplyKeyboard。
+MAIN_KB = InlineKeyboardMarkup([
+    [
+        InlineKeyboardButton("📦 订阅列表", callback_data="menu:list"),
+        InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+    ]
+])
+
+
+def render_home_text(user_name: str | None = None) -> str:
+    safe_name = html.escape(str(user_name or "用户").strip() or "用户")
+    return (
+        f"👋 你好，{safe_name}！\n\n"
+        "🤖 订阅管理机器人\n"
+        "发送订阅链接，或发送文本 / 上传 <code>.txt</code>、<code>.log</code>、<code>.yaml</code>、<code>.yml</code> 文件，\n"
+        "可进行订阅查询、节点解析、导出节点、短链生成与 API 测试。\n"
+        "更多内容请查看帮助菜单。"
+    )
 
 HELP_TEXT = (
     "📌 支持直接发送任意数量的订阅链接\n"
@@ -912,14 +945,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     name = update.effective_user.first_name or "用户"
-    await update.effective_message.reply_text(
-        f"👋 你好，{name}！\n\n"
-        "🤖 订阅管理机器人\n"
-        "发送订阅链接，或发送文本 / 上传 .txt、.log、.yaml、.yml 文件，"
-        "可进行订阅查询、节点解析、导出节点和短链生成。\n"
-        "更多内容请查看帮助菜单。",
-        reply_markup=MAIN_KB,
+    # 清除历史上可能残留在客户端底部的旧 ReplyKeyboard，再发送图一同款内联主菜单卡片
+    cleanup_msg = None
+    with suppress(Exception):
+        cleanup_msg = await update.effective_message.reply_text(
+            "🔄 正在加载主菜单…",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    await update.effective_message.reply_html(
+        render_home_text(name),
+        reply_markup=HOME_INLINE_KB,
+        disable_web_page_preview=True,
     )
+    if cleanup_msg is not None and callable(getattr(cleanup_msg, "delete", None)):
+        with suppress(Exception):
+            await cleanup_msg.delete()
 
 
 def render_help_text(bot: Any = None) -> str:
@@ -961,10 +1001,8 @@ def render_help_text(bot: Any = None) -> str:
     )
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await deny(update):
-        return
-    kb = InlineKeyboardMarkup([
+def _help_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
             InlineKeyboardButton("🧪 临时节点", callback_data="temp:open"),
@@ -974,9 +1012,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
         ],
     ])
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await deny(update):
+        return
     await update.effective_message.reply_html(
         render_help_text(getattr(context, "bot", None)),
-        reply_markup=kb,
+        reply_markup=_help_keyboard(),
         disable_web_page_preview=True,
     )
 
@@ -988,10 +1031,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_html(text, reply_markup=kb, disable_web_page_preview=True)
 
 
-async def cmd_expire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await deny(update):
-        return
-    subs = await store.list_subs_meta(scope_owner(update))
+async def render_expire_page(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    subs = await store.list_subs_meta(user_id)
     now = int(time.time())
     soon = []
     for i, sub in enumerate(subs, start=1):
@@ -1006,11 +1047,10 @@ async def cmd_expire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
             InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
         ]]
-        await update.effective_message.reply_text(
+        return (
             "🟠 临期列表为空，当前没有 14 天内到期的订阅。",
-            reply_markup=InlineKeyboardMarkup(nav),
+            InlineKeyboardMarkup(nav),
         )
-        return
     # 临期列表一次性展示：正文最多 20 条摘要，按钮最多 40 个且全部在同一“页”内。
     # 旧实现把全部条目交给 list_keyboard(page_size=8)：超过 8 条时出现指向主列表的
     # ➡️ 翻页（点了跳到普通订阅列表第 2 页），和正文里写死的“第1/1页”自相矛盾。
@@ -1023,6 +1063,13 @@ async def cmd_expire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         + more
     )
     kb = list_keyboard(0, len(shown), max(1, len(shown)), shown)
+    return text, kb
+
+
+async def cmd_expire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await deny(update):
+        return
+    text, kb = await render_expire_page(scope_owner(update))
     await update.effective_message.reply_html(text, reply_markup=kb)
 
 
@@ -1275,25 +1322,21 @@ def _export_copy_keyboard(code: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await deny(update):
-        return
-    user_id = scope_owner(update)
+async def render_export_page(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     subs = await store.list_subs(user_id)
     for sub in subs:
         if not nodes_of(sub):
             await refresh_sub(user_id, sub)
     all_nodes = await mapped_nodes_for_user(user_id)
     if not all_nodes:
-        await update.effective_message.reply_text("暂无可导出节点。", reply_markup=MAIN_KB)
-        return
+        return "暂无可导出节点。", MAIN_KB
     code = await store.create_short(user_id, "aggregate://all")
     clash_url = f"{PUBLIC_BASE_URL}/agg/{code}/clash"
     singbox_url = f"{PUBLIC_BASE_URL}/agg/{code}/singbox"
     base64_url = f"{PUBLIC_BASE_URL}/agg/{code}/base64"
     surge_url = f"{PUBLIC_BASE_URL}/agg/{code}/surge"
     qx_url = f"{PUBLIC_BASE_URL}/agg/{code}/qx"
-    await update.effective_message.reply_html(
+    text = (
         f"📦 <b>导出完成</b>\n"
         f"节点数: <b>{len(all_nodes)}</b>（已自动去重）｜ 协议: <code>{html.escape(_protocol_summary(all_nodes))}</code>\n\n"
         f"Clash Meta:\n<code>{html.escape(clash_url)}</code>\n"
@@ -1301,8 +1344,18 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Base64:\n<code>{html.escape(base64_url)}</code>\n"
         f"Surge:\n<code>{html.escape(surge_url)}</code>\n"
         f"QX:\n<code>{html.escape(qx_url)}</code>\n\n"
-        f"短链码: <code>{html.escape(code)}</code>",
-        reply_markup=_export_copy_keyboard(code),
+        f"短链码: <code>{html.escape(code)}</code>"
+    )
+    return text, _export_copy_keyboard(code)
+
+
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await deny(update):
+        return
+    text, kb = await render_export_page(scope_owner(update))
+    await update.effective_message.reply_html(
+        text,
+        reply_markup=kb,
         disable_web_page_preview=True,
     )
 
@@ -2394,6 +2447,29 @@ def _callback_menu_owner(update: Update) -> int | None:
     return owner_id
 
 
+async def _edit_or_reply_html(
+    q: Any,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    """优先原地编辑内联卡片消息，失败时自动退回发送新消息。"""
+    try:
+        await q.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        msg = getattr(q, "message", None)
+        if msg is not None and callable(getattr(msg, "reply_html", None)):
+            await msg.reply_html(
+                text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not q:
@@ -2518,8 +2594,70 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await q.answer()
     if data == "noop":
         return
-    if data == "list:home":
-        await q.message.reply_text("🏠 主菜单", reply_markup=MAIN_KB)
+    if data in ("list:home", "menu:cancel"):
+        interaction_data(update, context).pop("await", None)
+        user_name = getattr(update.effective_user, "first_name", None) or "用户"
+        await _edit_or_reply_html(q, render_home_text(user_name), HOME_INLINE_KB)
+        return
+    if data == "menu:list":
+        text, kb = await render_list(user_id, 0, sort_mode=_current_sort_mode(context))
+        await _edit_or_reply_html(q, text, kb)
+        return
+    if data == "menu:expire":
+        text, kb = await render_expire_page(user_id)
+        await _edit_or_reply_html(q, text, kb)
+        return
+    if data == "menu:export":
+        with suppress(Exception):
+            await q.edit_message_text("📤 正在汇总节点并生成导出链接…")
+        text, kb = await render_export_page(user_id)
+        await _edit_or_reply_html(q, text, kb)
+        return
+    if data == "menu:updateall":
+        n = await store.count_subs(user_id)
+        if not n:
+            await _edit_or_reply_html(q, "暂无订阅可更新。", MAIN_KB)
+            return
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ 确认更新", callback_data="upd:run"),
+                InlineKeyboardButton("❌ 取消", callback_data="upd:cancel"),
+            ]
+        ])
+        await _edit_or_reply_html(q, f"🔄 确认要批量更新 <b>{n}</b> 条订阅吗？", keyboard)
+        return
+    if data == "menu:renumber":
+        n = await store.renumber(user_id)
+        await _edit_or_reply_html(q, f"🔢 已核对订阅编号，当前共 <b>{n}</b> 条订阅。", MAIN_KB)
+        return
+    if data == "menu:recycle":
+        text, kb = await render_recycle_page(user_id, 0)
+        await _edit_or_reply_html(q, text, kb)
+        return
+    if data == "menu:path":
+        text, kb = await render_path_page(user_id)
+        await _edit_or_reply_html(q, text, kb)
+        return
+    if data == "menu:temp":
+        text, kb = await render_temp_page(user_id)
+        await _edit_or_reply_html(q, text, kb)
+        return
+    if data == "menu:ai":
+        interaction_data(update, context)["await"] = "api_test"
+        ai_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("❌ 取消", callback_data="menu:cancel"),
+                InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+            ]
+        ])
+        await _edit_or_reply_html(
+            q,
+            f"🧪 <b>API 批量测试</b>\n<blockquote>{html.escape(API_TEST_USAGE)}</blockquote>",
+            ai_kb,
+        )
+        return
+    if data == "menu:help":
+        await _edit_or_reply_html(q, render_help_text(getattr(context, "bot", None)), _help_keyboard())
         return
     if data == "list:jump":
         interaction_data(update, context)["await"] = "list_jump"

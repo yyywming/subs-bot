@@ -21,6 +21,8 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, patch
 
+from telegram import InlineKeyboardMarkup, ReplyKeyboardRemove
+
 # 只设置 BOT_TOKEN：config 在进程内只加载一次，本文件按字母序最先被 discover 导入，
 # 若在这里设置 ALLOWED_USER_IDS/ADMIN_USER_IDS 会改变其它测试文件依赖的授权配置。
 # 本文件的流程测试统一 patch bot.allowed，不依赖环境白名单。
@@ -365,6 +367,79 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         await B.on_callback(cb_upd, ctx)
         self.assertIn("临时节点", edits[-1][0])
         self.assertIn("HK01", edits[-1][0])
+
+    async def test_inline_home_menu_and_callbacks(self) -> None:
+        # 1. HOME_INLINE_KB 和 MAIN_KB 都必须是内联键盘，不再弹出底部 ReplyKeyboard
+        self.assertIsInstance(B.HOME_INLINE_KB, InlineKeyboardMarkup)
+        self.assertIsInstance(B.MAIN_KB, InlineKeyboardMarkup)
+        self.assertEqual(len(B.HOME_INLINE_KB.inline_keyboard), 5)
+        self.assertTrue(all(len(row) == 2 for row in B.HOME_INLINE_KB.inline_keyboard))
+
+        # 2. /start 先清理旧底部键盘并删除临时消息，再发内联两列卡片主菜单
+        sent: list[tuple[str, str, dict]] = []
+        cleanup_deleted = False
+
+        async def _mark_delete() -> None:
+            nonlocal cleanup_deleted
+            cleanup_deleted = True
+
+        async def _reply_text(t: str, **kw):
+            sent.append(("text", t, kw))
+            return NS(delete=_mark_delete)
+
+        async def _reply_html(t: str, **kw):
+            sent.append(("html", t, kw))
+            return NS()
+
+        start_upd = NS(
+            effective_user=NS(id=1, first_name="yyy"),
+            effective_chat=NS(id=1, type="private"),
+            effective_message=NS(reply_text=_reply_text, reply_html=_reply_html),
+            callback_query=None,
+        )
+        ctx = NS(user_data={}, args=[], bot=NS(id=42, username="subsbot"))
+        await B.cmd_start(start_upd, ctx)
+        self.assertTrue(cleanup_deleted)
+        self.assertIsInstance(sent[0][2]["reply_markup"], ReplyKeyboardRemove)
+        self.assertEqual(sent[1][0], "html")
+        self.assertIn("你好，yyy", sent[1][1])
+        self.assertIs(sent[1][2]["reply_markup"], B.HOME_INLINE_KB)
+
+        # 3. 准备 1 条带节点的订阅后，逐一点击 list:home 及全部 menu:* 按钮，验证原地编辑正常
+        await B.store.add_imported_sub(1, "SubOne", [{"name": "N1", "type": "ss", "server": "1.1.1.1", "port": 8388, "cipher": "aes-256-gcm", "password": "p"}])
+
+        # list:home 原地切回主菜单
+        upd_home, edits_home, _ = self._cb("list:home")
+        await B.on_callback(upd_home, ctx)
+        self.assertIn("你好", edits_home[-1][0])
+        self.assertIs(edits_home[-1][1]["reply_markup"], B.HOME_INLINE_KB)
+
+        for cb_data, expected_substr in (
+            ("menu:list", "订阅列表"),
+            ("menu:expire", "临期列表"),
+            ("menu:export", "导出完成"),
+            ("menu:updateall", "批量更新"),
+            ("menu:renumber", "核对订阅编号"),
+            ("menu:recycle", "回收站"),
+            ("menu:path", "路径对应"),
+            ("menu:temp", "临时列表"),
+            ("menu:help", "使用帮助"),
+        ):
+            u, e, _ = self._cb(cb_data)
+            await B.on_callback(u, ctx)
+            self.assertTrue(e, f"{cb_data} did not edit message")
+            self.assertIn(expected_substr, e[-1][0], cb_data)
+
+        # menu:ai 进入等待状态，点击 menu:cancel 清除等待并原地回到主菜单
+        u_ai, e_ai, _ = self._cb("menu:ai")
+        await B.on_callback(u_ai, ctx)
+        self.assertIn("API 批量测试", e_ai[-1][0])
+        self.assertEqual(B.interaction_data(u_ai, ctx).get("await"), "api_test")
+
+        u_cancel, e_cancel, _ = self._cb("menu:cancel")
+        await B.on_callback(u_cancel, ctx)
+        self.assertIsNone(B.interaction_data(u_cancel, ctx).get("await"))
+        self.assertIs(e_cancel[-1][1]["reply_markup"], B.HOME_INLINE_KB)
 
 
 if __name__ == "__main__":
