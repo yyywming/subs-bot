@@ -25,6 +25,8 @@ from unittest.mock import AsyncMock, patch
 # 若在这里设置 ALLOWED_USER_IDS/ADMIN_USER_IDS 会改变其它测试文件依赖的授权配置。
 # 本文件的流程测试统一 patch bot.allowed，不依赖环境白名单。
 os.environ.setdefault("BOT_TOKEN", "0:TEST")
+os.environ.setdefault("ALLOWED_USER_IDS", "1,2")
+os.environ.setdefault("ADMIN_USER_IDS", "1")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
