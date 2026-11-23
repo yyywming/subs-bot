@@ -90,6 +90,7 @@ from apitest import (
     format_probe_result,
     looks_like_api_test,
     parse_api_pairs,
+    parse_api_specs,
     probe_api,
 )
 
@@ -585,11 +586,11 @@ def _protocol_summary(nodes: list[dict[str, Any]]) -> str:
 
 def detail_text(sub: dict[str, Any], idx: int) -> str:
     nodes = nodes_of(sub)
-    used = sub.get("traffic_used")
+    traffic_used = sub.get("traffic_used")
     total = sub.get("traffic_total")
     remain_traffic = None
-    if used is not None and total is not None:
-        remain_traffic = max(total - used, 0)
+    if traffic_used is not None and total is not None:
+        remain_traffic = max(total - traffic_used, 0)
 
     status_badge = _sub_status_badge(sub, remain_traffic)
     proto_line = _protocol_summary(nodes)
@@ -603,17 +604,17 @@ def detail_text(sub: dict[str, Any], idx: int) -> str:
     err = sub.get("last_error")
     err_text = truncate_utf16(str(err), 300) if err else ""
     url_text = truncate_utf16(str(sub.get("url") or ""), 600)
-    fixed_cost = 700 + _utf16_len(html.escape(str(sub.get("name") or ""))) + _utf16_len(html.escape(url_text)) + _utf16_len(html.escape(err_text))
+    fixed_cost = 760 + _utf16_len(html.escape(str(sub.get("name") or ""))) + _utf16_len(html.escape(url_text)) + _utf16_len(html.escape(err_text))
     node_budget = max(300, TG_SAFE_BODY - fixed_cost)
     node_lines: list[str] = []
-    used = 0
+    used_chars = 0
     for n in nodes[:display_limit]:
         line = f"• {html.escape(truncate_utf16(str(n.get('name') or '未命名'), 80))}"
         cost = _utf16_len(line) + 1
-        if used + cost > node_budget:
+        if used_chars + cost > node_budget:
             break
         node_lines.append(line)
-        used += cost
+        used_chars += cost
     shown = len(node_lines)
     if not node_lines:
         node_preview = "未解析到节点"
@@ -622,19 +623,23 @@ def detail_text(sub: dict[str, Any], idx: int) -> str:
             node_lines.append(f"\n<i>（前 {shown} 个已展示，点击下方按钮可翻页浏览全量 {len(nodes)} 个节点）</i>")
         node_preview = "\n".join(node_lines)
 
-    err_line = f"\n⚠️ 刷新错误: {html.escape(err_text)}" if err else ""
+    summary_lines = [
+        f"流量详情: {html.escape(format_bytes_gb(traffic_used))} / {html.escape(format_bytes_gb(total))}",
+        f"使用进度: {html.escape(progress_bar(traffic_used, total))}",
+        f"剩余可用: {html.escape(format_bytes_gb(remain_traffic))}",
+        f"过期时间: {html.escape(format_expire(sub.get('expire_at')))}",
+        f"剩余时间: {html.escape(remain_text(sub.get('expire_at')))}",
+        f"协议分布: {html.escape(proto_line)}",
+        f"更新时间: {html.escape(updated_str)}",
+    ]
+    if err:
+        summary_lines.append(f"⚠️ 刷新错误: {html.escape(err_text)}")
+
     return (
-        f"配置名称: <b>{html.escape(sub['name'])}</b>  ({status_badge})\n"
+        f"📦 <b>{html.escape(sub['name'])}</b>  ({status_badge})\n"
         f"订阅链接: <code>{html.escape(url_text)}</code>\n"
-        f"流量详情: {html.escape(format_bytes_gb(used))} / {html.escape(format_bytes_gb(total))}\n"
-        f"使用进度: {html.escape(progress_bar(used, total))}\n"
-        f"剩余可用: {html.escape(format_bytes_gb(remain_traffic))}\n"
-        f"过期时间: {html.escape(format_expire(sub.get('expire_at')))}\n"
-        f"剩余时间: {html.escape(remain_text(sub.get('expire_at')))}\n"
-        f"协议分布: {html.escape(proto_line)}\n"
-        f"更新时间: {html.escape(updated_str)}\n"
-        f"📡 节点列表 ({len(nodes)} 个，支持下拉展开):\n<blockquote expandable>{node_preview}</blockquote>"
-        f"{err_line}"
+        f"<blockquote>{chr(10).join(summary_lines)}</blockquote>\n"
+        f"<blockquote expandable>📡 节点列表 ({len(nodes)} 个，支持下拉展开):\n{node_preview}</blockquote>"
     )
 
 
@@ -917,10 +922,63 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def render_help_text(bot: Any = None) -> str:
+    uname = html.escape(get_bot_username(bot))
+    return (
+        "📖 <b>使用帮助</b>\n"
+        "<blockquote>"
+        "📌 直接发订阅链接（支持多条并发导入）或 <code>名称|链接</code>\n"
+        "📄 上传 <code>.txt</code> / <code>.log</code> / <code>.yaml</code> / <code>.yml</code> / <code>.json</code> 自动导入\n"
+        "🤖 直接发 <code>API地址 + Key [+ 模型名]</code> 实测 OpenAI 兼容接口\n"
+        "♻️ 删除后 30 天内可在回收站一键恢复"
+        "</blockquote>\n"
+        "<blockquote>"
+        "<b>常用指令</b>\n"
+        "• /list — 订阅列表（支持流量/到期/名称排序）\n"
+        "• /expire — 查看 14 天内临期订阅\n"
+        "• /export — 全部订阅与临时节点聚合去重导出\n"
+        "• /temp — 管理临时节点（单删 / 一键转正式订阅）\n"
+        "• /path 关键词 名称 — 节点路径映射（<code>/path clear</code> 清空）\n"
+        "• /s 关键词 — 搜索订阅并直达详情\n"
+        "• /o 关键词 — 聚合导出搜索结果\n"
+        "• /d 关键词 — 删除匹配订阅（可回收站恢复）\n"
+        "• /ai [地址 Key 模型] — 批量测试 API 可用性\n"
+        "• /g 关键词 — 搜索 GitHub 仓库与公开代码\n"
+        "• /i 排序 — 切换排序（默认 / 流量 / 到期 / 名称）"
+        "</blockquote>\n"
+        "<blockquote expandable>"
+        "<b>内联与私密分享</b>\n"
+        f"• 内联查订阅：<code>@{uname} 关键词</code>\n"
+        f"• 私密分享：<code>@{uname} Share [x份数] [id用户ID] [s分钟] 内容</code>\n\n"
+        "<b>跨会话与群聊规则</b>\n"
+        "按用户 ID 管理个人订阅，同一用户在私聊与群聊共用数据，他人无法操作你的菜单；群内无关聊天静默不打扰。\n\n"
+        "<b>授权管理（仅管理员私聊）</b>\n"
+        "• /auth list — 查看授权名单\n"
+        "• /auth add 用户ID — 添加授权（可回复消息）\n"
+        "• /auth remove 用户ID — 撤销授权（可回复消息）\n\n"
+        "💡 私聊直接发送数字编号（如 <code>1</code>）可快速打开对应订阅详情。"
+        "</blockquote>"
+    )
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
-    await update.effective_message.reply_html(HELP_TEXT, reply_markup=MAIN_KB, disable_web_page_preview=True)
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+            InlineKeyboardButton("🧪 临时节点", callback_data="temp:open"),
+        ],
+        [
+            InlineKeyboardButton("♻️ 回收站", callback_data="recycle:page:0"),
+            InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+        ],
+    ])
+    await update.effective_message.reply_html(
+        render_help_text(getattr(context, "bot", None)),
+        reply_markup=kb,
+        disable_web_page_preview=True,
+    )
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1092,6 +1150,22 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         doc = InputFile(content.encode("utf-8"), filename=name)
         await context.bot.send_document(chat_id=deliver_to, document=doc)
     stats = f"有效:{len(valid)} | 耗尽:{len(drained)} | 过期:{len(expired)} | 失败:{len(failed)}"
+    detail_items: list[str] = []
+    for s in failed[:15]:
+        err_s = truncate_utf16(str(s.get("last_error") or "未知错误"), 60)
+        detail_items.append(f"❌ <b>{html.escape(str(s['name']))}</b>：{html.escape(err_s)}")
+    for s in drained[:10]:
+        detail_items.append(f"🟠 <b>{html.escape(str(s['name']))}</b>：流量已耗尽")
+    for s in expired[:10]:
+        detail_items.append(f"⏳ <b>{html.escape(str(s['name']))}</b>：已过期")
+    card_html = (
+        f"📊 <b>批量更新汇总</b>（耗时 {elapsed:.1f}s）\n"
+        f"<blockquote>✅ 有效: {len(valid)} ｜ 🟠 耗尽: {len(drained)}\n"
+        f"⏳ 过期: {len(expired)} ｜ ❌ 失败: {len(failed)}</blockquote>"
+    )
+    if detail_items:
+        card_html += "\n<blockquote expandable>⚠️ <b>异常与过期明细（点击展开）</b>\n" + "\n".join(detail_items) + "</blockquote>"
+
     if failed:
         keyboard = InlineKeyboardMarkup([
             [
@@ -1105,11 +1179,17 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ])
         await context.bot.send_message(
             chat_id=deliver_to,
-            text=f"{stats}\n\n检测到 {len(failed)} 条失效订阅，是否从订阅列表中删除？",
+            text=f"{card_html}\n\n检测到 {len(failed)} 条失效订阅，是否从订阅列表中删除？",
             reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
         )
     else:
-        await context.bot.send_message(chat_id=deliver_to, text=stats, reply_markup=MAIN_KB)
+        await context.bot.send_message(
+            chat_id=deliver_to,
+            text=card_html,
+            reply_markup=MAIN_KB,
+            parse_mode=ParseMode.HTML,
+        )
         text_list, kb_list = await render_list(user_id, 0, sort_mode=_current_sort_mode(context))
         await context.bot.send_message(chat_id=deliver_to, text=text_list, reply_markup=kb_list, parse_mode=ParseMode.HTML)
 
@@ -1372,27 +1452,41 @@ async def cmd_inline_sort(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 API_TEST_USAGE = (
     "请发送要测试的 API 地址和 Key，支持以下写法（多组可连续发送，最多 "
     f"{MAX_API_PAIRS} 组）：\n"
-    "• 地址 和 Key 分两行\n"
-    "• 地址 Key（同一行空格分隔）\n"
-    "• 地址|Key\n"
+    "• 地址 和 Key 分两行（可加第三行 model=模型名）\n"
+    "• 地址 Key [指定模型名]\n"
+    "• 地址|Key[|指定模型名]\n"
+    "也可以直接发送：/ai 地址 Key [模型名]\n"
     "地址可写到域名、/v1 或 /v1/chat/completions，会自动规范化。"
 )
 
 
 async def run_api_tests(
-    update: Update, pairs: list[tuple[str, str]], *, is_group: bool, stray: int = 0
+    update: Update,
+    pairs: list[tuple[str, str]] | list[tuple[str, str, str | None]],
+    *,
+    is_group: bool,
+    stray: int = 0,
 ) -> None:
-    """并发检测多组「地址 + Key」，每组一条结果消息。群聊里 Key 打码，避免泄露给群成员。"""
+    """并发检测多组「地址 + Key（+ 可选指定模型）」，每组一条结果消息。群聊里 Key 打码。"""
     message = update.effective_message
-    pairs = pairs[:MAX_API_PAIRS]
-    status_msg = await message.reply_text(f"🧪 正在测试 {len(pairs)} 组 API，请稍候…")
+    specs: list[tuple[str, str, str | None]] = [
+        (item[0], item[1], item[2] if len(item) >= 3 else None)
+        for item in pairs[:MAX_API_PAIRS]
+    ]
+    status_msg = await message.reply_text(f"🧪 正在测试 {len(specs)} 组 API，请稍候…")
     sem = asyncio.Semaphore(5)
 
-    async def _one(api_url: str, key: str) -> dict[str, Any]:
+    async def _one(api_url: str, key: str, model_name: str | None) -> dict[str, Any]:
         async with sem:
-            return await probe_api(api_url, key, get_session=get_session, check_url=_check_public_url)
+            kwargs: dict[str, Any] = {
+                "get_session": get_session,
+                "check_url": _check_public_url,
+            }
+            if model_name:
+                kwargs["model"] = model_name
+            return await probe_api(api_url, key, **kwargs)
 
-    results = await asyncio.gather(*(_one(u, k) for u, k in pairs))
+    results = await asyncio.gather(*(_one(u, k, m) for u, k, m in specs))
 
     rendered: list[tuple[str, InlineKeyboardMarkup | None]] = []
     for res in results:
@@ -1428,6 +1522,18 @@ async def run_api_tests(
 
 async def cmd_api_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
+        return
+    raw_args = " ".join(context.args or []).strip()
+    if raw_args:
+        specs, stray = parse_api_specs(raw_args)
+        if specs:
+            is_group = getattr(update.effective_chat, "type", None) in {"group", "supergroup"}
+            await run_api_tests(update, specs, is_group=is_group, stray=stray)
+            return
+        await update.effective_message.reply_text(
+            "⚠️ 格式错误：未识别到「API 地址 + Key」。\n" + API_TEST_USAGE,
+            reply_markup=MAIN_KB,
+        )
         return
     interaction_data(update, context)["await"] = "api_test"
     await update.effective_message.reply_text(
@@ -1748,6 +1854,63 @@ def group_input(text: str) -> bool:
     )
 
 
+def _sub_brief_meta(sub: dict[str, Any]) -> str:
+    """简短单行状态摘要：节点数 · 剩余流量 · 剩余时间（或报错）。"""
+    err = sub.get("last_error")
+    if err:
+        return f"⚠️ {truncate_utf16(str(err), 60)}"
+    remain = remain_traffic_gb(sub)
+    parts = [f"{int(sub.get('node_count') or 0)} 节点"]
+    if remain is not None:
+        parts.append(f"剩 {remain:.2f} GB")
+    exp_s = remain_text(sub.get("expire_at"))
+    parts.append("长期" if exp_s == "长期有效" else exp_s)
+    return " · ".join(parts)
+
+
+def _sub_receipt_keyboard(subs: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if len(subs) == 1:
+        sid = int(subs[0]["id"])
+        rows.append([
+            InlineKeyboardButton("📂 查看详情", callback_data=f"sub:open:{sid}:0"),
+            InlineKeyboardButton("⚡ Clash 短链", callback_data=f"sub:fmt:{sid}:clash"),
+        ])
+    elif subs:
+        btns = [
+            InlineKeyboardButton(
+                f"📂 {truncate_utf16(str(s.get('name') or '订阅'), 20)}",
+                callback_data=f"sub:open:{int(s['id'])}:0",
+            )
+            for s in subs[:6]
+        ]
+        rows.extend(btns[i : i + 2] for i in range(0, len(btns), 2))
+    rows.append([
+        InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+        InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _format_single_sub_receipt(title: str, sub: dict[str, Any], idx: int | None = None) -> str:
+    remain = remain_traffic_gb(sub)
+    badge = _sub_status_badge(sub, remain)
+    prefix = f"#{idx} " if idx else ""
+    lines = [
+        f"状态: {badge}",
+        f"节点数: {int(sub.get('node_count') or 0)}",
+        f"剩余流量: {html.escape(format_bytes_gb(remain))}",
+        f"剩余时间: {html.escape(remain_text(sub.get('expire_at')))}",
+    ]
+    if sub.get("last_error"):
+        lines.append(f"⚠️ 错误: {html.escape(truncate_utf16(str(sub['last_error']), 120))}")
+    return (
+        f"{title}\n"
+        f"{prefix}<b>{html.escape(str(sub.get('name') or '未命名'))}</b>\n"
+        f"<blockquote>{chr(10).join(lines)}</blockquote>"
+    )
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user is None:
         return
@@ -1875,13 +2038,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # ── /ai API 测试状态机 ─────────────────────────
     if state == "api_test":
         scoped.pop("await", None)
-        pairs, stray = parse_api_pairs(text)
-        if not pairs:
+        specs, stray = parse_api_specs(text)
+        if not specs:
             await update.effective_message.reply_text(
                 "⚠️ 格式错误：未识别到「API 地址 + Key」。\n" + API_TEST_USAGE, reply_markup=MAIN_KB
             )
             return
-        await run_api_tests(update, pairs, is_group=is_group, stray=stray)
+        await run_api_tests(update, specs, is_group=is_group, stray=stray)
         return
 
     # ── 内联排序状态机 ─────────────────────────────
@@ -1939,11 +2102,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # 直接发送「API 地址 + Key」：必须在「名称|链接」和订阅链接识别之前判断，
+    # 直接发送「API 地址 + Key（+ 可选模型名）」：必须在「名称|链接」和订阅链接识别之前判断，
     # 否则地址会被当成订阅链接加进列表（Key 以 == 结尾也不能落进路径规则）。
     if (not is_group or addressed) and looks_like_api_test(text):
-        pairs, _stray = parse_api_pairs(text)
-        await run_api_tests(update, pairs, is_group=is_group)
+        specs, _stray = parse_api_specs(text)
+        await run_api_tests(update, specs, is_group=is_group)
         return
 
     if (not is_group or addressed) and "=" in text and not text.lower().startswith("http") and "://" not in text.split("=", 1)[0]:
@@ -1977,8 +2140,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 subs = await store.list_subs_meta(user_id)
                 idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == int(sub["id"])), 1)
                 await update.effective_message.reply_html(
-                    f"🔄 <b>订阅已存在，已为您自动更新！</b>\n\n#{idx} <b>{html.escape(sub['name'])}</b>\n节点数: {sub['node_count']}",
-                    reply_markup=MAIN_KB,
+                    _format_single_sub_receipt("🔄 <b>订阅已存在，已为您自动更新</b>", sub, idx),
+                    reply_markup=_sub_receipt_keyboard([sub]),
+                    disable_web_page_preview=True,
                 )
                 return
 
@@ -1986,9 +2150,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             sub = await refresh_sub(
                 user_id, sub, rename=not bool(name), meta_only=True
             )
+            subs = await store.list_subs_meta(user_id)
+            idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == int(sub["id"])), None)
             await update.effective_message.reply_html(
-                f"✅ 已添加订阅 <b>{html.escape(sub['name'])}</b>\n节点: {sub['node_count']}",
-                reply_markup=MAIN_KB,
+                _format_single_sub_receipt("✅ <b>已添加订阅</b>", sub, idx),
+                reply_markup=_sub_receipt_keyboard([sub]),
+                disable_web_page_preview=True,
             )
             return
 
@@ -2025,35 +2192,64 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 return await refresh_sub(user_id, sub_row, rename=is_new, meta_only=True)
 
         refreshed_rows = await asyncio.gather(*(_refresh_one(n, s) for n, s in tasks_spec))
-        added: list[str] = []
-        updated_list: list[str] = []
-        for (is_new, _), refreshed in zip(tasks_spec, refreshed_rows):
-            line_str = f"{refreshed['name']} ({refreshed['node_count']} 节点)"
-            if is_new:
-                added.append(line_str)
-            else:
-                updated_list.append(line_str)
+        if len(refreshed_rows) == 1 and not skipped_new:
+            is_new = tasks_spec[0][0]
+            sub = refreshed_rows[0]
+            subs_all = await store.list_subs_meta(user_id)
+            idx = next((i for i, s in enumerate(subs_all, 1) if int(s["id"]) == int(sub["id"])), None)
+            title = "✅ <b>已添加订阅</b>" if is_new else "🔄 <b>检测到重复订阅，已为您自动更新</b>"
+            await update.effective_message.reply_html(
+                _format_single_sub_receipt(title, sub, idx),
+                reply_markup=_sub_receipt_keyboard([sub]),
+                disable_web_page_preview=True,
+            )
+            return
 
-        msg_lines = []
-        if added:
-            msg_lines.append("✅ 已添加新增订阅:\n" + "\n".join(added))
-        if updated_list:
-            msg_lines.append("🔄 检测到重复订阅，已为您自动更新:\n" + "\n".join(updated_list))
+        added_lines: list[str] = []
+        updated_lines: list[str] = []
+        for (is_new, _), refreshed in zip(tasks_spec, refreshed_rows):
+            line_str = f"• <b>{html.escape(str(refreshed['name']))}</b> ({html.escape(_sub_brief_meta(refreshed))})"
+            if is_new:
+                added_lines.append(line_str)
+            else:
+                updated_lines.append(line_str)
+
+        blocks: list[str] = []
+        if added_lines:
+            blocks.append(f"✅ <b>已添加新增订阅 ({len(added_lines)})</b>\n<blockquote>" + "\n".join(added_lines[:20]) + "</blockquote>")
+        if updated_lines:
+            blocks.append(f"🔄 <b>检测到重复订阅，已自动更新 ({len(updated_lines)})</b>\n<blockquote>" + "\n".join(updated_lines[:20]) + "</blockquote>")
         if skipped_new:
-            msg_lines.append(f"⚠️ 单次最多新增 {MAX_IMPORTED_SUBSCRIPTIONS} 条订阅，另有 {skipped_new} 条未处理，请分批发送。")
-        await update.effective_message.reply_text(
-            truncate_utf16("\n\n".join(msg_lines), TG_MESSAGE_LIMIT - 96), reply_markup=MAIN_KB
+            blocks.append(f"⚠️ 单次最多新增 {MAX_IMPORTED_SUBSCRIPTIONS} 条订阅，另有 {skipped_new} 条未处理，请分批发送。")
+        await update.effective_message.reply_html(
+            "\n\n".join(blocks),
+            reply_markup=_sub_receipt_keyboard(list(refreshed_rows)),
+            disable_web_page_preview=True,
         )
         return
 
     # node share links
     links = extract_share_links(text)
     if links:
+        names: list[str] = []
         for link in links:
-            await store.add_temp(user_id, link, node_name_from_url(link))
-        await update.effective_message.reply_text(
-            f"✅ 已加入临时列表 {len(links)} 条。发送 /temp 查看。",
-            reply_markup=MAIN_KB,
+            n_name = node_name_from_url(link)
+            await store.add_temp(user_id, link, n_name)
+            names.append(n_name)
+        preview = "\n".join(f"• {html.escape(truncate_utf16(n, 48))}" for n in names[:6])
+        if len(names) > 6:
+            preview += f"\n<i>…等共 {len(names)} 条</i>"
+        temp_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🧪 查看临时节点", callback_data="temp:open"),
+                InlineKeyboardButton("📦 转为正式订阅", callback_data="temp:tosub"),
+            ],
+            [InlineKeyboardButton("🏠 主菜单", callback_data="list:home")],
+        ])
+        await update.effective_message.reply_html(
+            f"✅ <b>已加入临时列表 {len(links)} 条</b>\n<blockquote>{preview}</blockquote>",
+            reply_markup=temp_kb,
+            disable_web_page_preview=True,
         )
         return
 
@@ -2095,6 +2291,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = scope_owner(update)
     parsed_nodes = parse_nodes_from_text(text)
     created: list[tuple[str, int]] = []
+    imported_subs: list[dict[str, Any]] = []
     failures: list[str] = []
     skipped = 0
 
@@ -2104,11 +2301,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         existing_imported = [s for s in await store.list_subs_meta(user_id) if s.get("name") == name and s.get("url", "").startswith("uploaded://")]
         if existing_imported:
             old_sub = existing_imported[0]
-            await store.update_sub(user_id, int(old_sub["id"]), nodes_json=json.dumps(parsed_nodes[:MAX_IMPORTED_NODES], ensure_ascii=False), last_error=None)
+            upd_sub = await store.update_sub(user_id, int(old_sub["id"]), return_meta=True, nodes_json=json.dumps(parsed_nodes[:MAX_IMPORTED_NODES], ensure_ascii=False), last_error=None)
             created.append((f"{name} (已覆盖更新)", len(parsed_nodes[:MAX_IMPORTED_NODES])))
+            if upd_sub:
+                imported_subs.append(upd_sub)
         else:
             local = await store.add_imported_sub(user_id, name, parsed_nodes[:MAX_IMPORTED_NODES])
             created.append((str(local["name"]), len(parsed_nodes[:MAX_IMPORTED_NODES])))
+            imported_subs.append(local)
     if not parsed_nodes or all(node.get("share") for node in parsed_nodes):
         existing_url_norm = {sub["url"].rstrip("/"): sub for sub in await store.list_subs_meta(user_id)}
         urls = _unique(value.rstrip(".,;:!?)]}>\"\'") for value in re.findall(r"https?://[^\s<>\"]+", text))
@@ -2129,43 +2329,52 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if doc_specs:
             sem = asyncio.Semaphore(max(1, UPDATE_CONCURRENCY))
 
-            async def _doc_refresh(is_new: bool, fallback_name: str, sub_row: dict[str, Any]) -> tuple[str, Any]:
+            async def _doc_refresh(is_new: bool, fallback_name: str, sub_row: dict[str, Any]) -> tuple[str, Any, dict[str, Any] | None]:
                 try:
                     async with sem:
                         updated = await refresh_sub(
                             user_id, sub_row, rename=is_new, meta_only=True
                         )
                     if not is_new:
-                        return ("updated", (f"{updated['name']} (已更新)", updated["node_count"]))
+                        return ("updated", (f"{updated['name']} (已更新)", updated["node_count"]), updated)
                     if updated.get("last_error"):
-                        return ("failed", f"{fallback_name}: {updated['last_error']}")
-                    return ("created", (str(updated.get("name") or fallback_name), updated["node_count"]))
+                        return ("failed", f"{fallback_name}: {updated['last_error']}", None)
+                    return ("created", (str(updated.get("name") or fallback_name), updated["node_count"]), updated)
                 except Exception as exc:
                     if not is_new:
-                        return ("skipped", 1)
-                    return ("failed", f"{fallback_name}: {exc}")
+                        return ("skipped", 1, None)
+                    return ("failed", f"{fallback_name}: {exc}", None)
 
             outcomes = await asyncio.gather(
                 *(_doc_refresh(is_new, fname, srow) for is_new, fname, srow in doc_specs)
             )
-            for kind_tag, val in outcomes:
+            for kind_tag, val, sub_obj in outcomes:
                 if kind_tag in ("created", "updated"):
                     created.append(val)
+                    if sub_obj:
+                        imported_subs.append(sub_obj)
                 elif kind_tag == "skipped":
                     skipped += 1
                 elif kind_tag == "failed":
                     failures.append(str(val))
 
-    lines = [f"✅ 已处理文件：{html.escape(filename)}"]
-    for name, count in created:
-        lines.append(f"已添加：{html.escape(name)}（{count} 节点）")
+    body_lines: list[str] = []
+    for name, count in created[:20]:
+        body_lines.append(f"• <b>{html.escape(name)}</b>（{count} 节点）")
+    if len(created) > 20:
+        body_lines.append(f"<i>…其余 {len(created) - 20} 条已省略</i>")
     if skipped:
-        lines.append(f"已跳过重复订阅：{skipped} 条")
+        body_lines.append(f"已跳过重复订阅：{skipped} 条")
     if failures:
-        lines.append("失败：" + "；".join(html.escape(item) for item in failures[:8]))
-    if not created and not failures and not skipped:
-        lines.append("未识别到订阅或节点内容。")
-    await status.edit_text("\n".join(lines), reply_markup=MAIN_KB, parse_mode=ParseMode.HTML)
+        body_lines.append("⚠️ 失败：" + "；".join(html.escape(truncate_utf16(item, 80)) for item in failures[:8]))
+    if not body_lines:
+        body_lines.append("未识别到订阅或节点内容。")
+    # editMessageText 只支持 InlineKeyboardMarkup，不能传 ReplyKeyboardMarkup(MAIN_KB)
+    await status.edit_text(
+        f"✅ <b>已处理文件</b>：{html.escape(filename)}\n<blockquote>" + "\n".join(body_lines) + "</blockquote>",
+        reply_markup=_sub_receipt_keyboard(imported_subs),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 def _callback_menu_owner(update: Update) -> int | None:
@@ -2464,6 +2673,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await q.edit_message_text(f"✅ 已恢复：{restored['name']}", reply_markup=restored_kb)
         else:
             await q.edit_message_text("恢复失败，记录可能已过期。")
+        return
+    if data == "temp:open":
+        page_text, page_kb = await render_temp_page(user_id)
+        with suppress(Exception):
+            await q.edit_message_text(
+                page_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=page_kb,
+                disable_web_page_preview=True,
+            )
         return
     if data.startswith("temp:del:"):
         temp_id = int(data.split(":")[-1])

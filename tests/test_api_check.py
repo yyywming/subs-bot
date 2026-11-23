@@ -263,6 +263,53 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         await B.handle_text(upd, ctx)
         self.assertIn("格式错误", replies[-1][0])
 
+    async def test_custom_model_spec_bypass_models_404_and_ai_direct_args(self) -> None:
+        # 解析三种指定模型写法
+        s1, st1 = A.parse_api_specs(f"https://a.com|sk-{'x' * 32}|gpt-4o")
+        self.assertEqual((s1, st1), ([("https://a.com", f"sk-{'x' * 32}", "gpt-4o")], 0))
+        s2, st2 = A.parse_api_specs(f"https://a.com\nsk-{'x' * 32}\nmodel=claude-sonnet-4")
+        self.assertEqual((s2, st2), ([("https://a.com", f"sk-{'x' * 32}", "claude-sonnet-4")], 0))
+        self.assertTrue(A.looks_like_api_test(f"https://a.com sk-{'x' * 32} gpt-4o"))
+
+        # 当中转站禁用 /models (404) 但用户显式指定了模型时，继续直连 /chat/completions
+        base = "https://relay.example.com/v1"
+        res, session = await _probe(
+            {
+                ("GET", f"{base}/models"): FakeResp(404, {"error": {"message": "not found"}}),
+                ("POST", f"{base}/chat/completions"): FakeResp(200, {"choices": [{"message": {"content": "ok"}}]}),
+            },
+            url="https://relay.example.com",
+            key=f"sk-{'z' * 32}",
+        )
+        # 未指定模型时应失败
+        self.assertFalse(res["ok"])
+        res2 = await A.probe_api(
+            "https://relay.example.com",
+            f"sk-{'z' * 32}",
+            get_session=AsyncMock(return_value=FakeSession({
+                ("GET", f"{base}/models"): FakeResp(404, {"error": {"message": "not found"}}),
+                ("POST", f"{base}/chat/completions"): FakeResp(200, {"choices": [{"message": {"content": "ok"}}]}),
+            })),
+            check_url=AsyncMock(),
+            model="gpt-4o",
+        )
+        self.assertTrue(res2["ok"])
+        self.assertEqual(res2["model"], "gpt-4o")
+
+        # /ai 带参数一步直达测试，不进入 await 等待状态
+        fake = AsyncMock(return_value={
+            "base": base, "key": f"sk-{'z' * 32}", "models": ["gpt-4o"], "model": "gpt-4o",
+            "ok": True, "message": "ok", "elapsed": 0.2,
+        })
+        upd, replies, status = self._update(f"/ai https://relay.example.com sk-{'z' * 32} gpt-4o")
+        ctx = NS(user_data={}, args=["https://relay.example.com", f"sk-{'z' * 32}", "gpt-4o"], bot=NS(id=42, username="subsbot"))
+        with patch.object(B, "probe_api", fake):
+            await B.cmd_api_test(upd, ctx)
+        fake.assert_awaited_once()
+        self.assertEqual(fake.await_args.kwargs.get("model"), "gpt-4o")
+        self.assertIsNone(B.interaction_data(upd, ctx).get("await"))
+        self.assertIn("测试结果: ✅ 成功", status.edits[-1][0])
+
 
 if __name__ == "__main__":
     unittest.main()

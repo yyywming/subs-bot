@@ -150,12 +150,23 @@ class BotHelperTests(unittest.TestCase):
         nodes = [{"name": "超长节点名称" * 8 + str(i), "type": "ss"} for i in range(80)]
         sub = {
             "id": 1, "name": "N" * 64, "url": "https://example.com/" + "u" * 500, "token": "t",
-            "expire_at": None, "traffic_used": None, "traffic_total": None, "updated_at": int(time.time()),
+            "expire_at": None, "traffic_used": 12.5, "traffic_total": 100.0, "updated_at": int(time.time()),
             "last_error": "E" * 2000, "nodes_json": json.dumps(nodes, ensure_ascii=False),
         }
         text = B.detail_text(sub, 1)
         self.assertLessEqual(B._utf16_len(text), 4096)
         self.assertIn("点击下方按钮可翻页浏览全量 80 个节点", text)
+        # 回归：节点截断计数器不得覆盖已用流量（曾把 traffic_used 覆盖成节点字符数）
+        self.assertIn("流量详情: 12.50 GB / 100.00 GB", text)
+        self.assertIn("12%", text)
+        self.assertIn("<blockquote>", text)
+
+    def test_render_help_text_uses_calibrated_username(self) -> None:
+        fake_bot = NS(username="real_prod_bot")
+        text = B.render_help_text(fake_bot)
+        self.assertIn("@real_prod_bot", text)
+        self.assertIn("<blockquote>", text)
+        self.assertIn("<blockquote expandable>", text)
 
 
 class BotFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -338,6 +349,22 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         code = await B.store.create_short(1, "https://a.com/x\r\nSet-Cookie: evil=1")
         resp = await B.http_short(NS(match_info={"code": code}))
         self.assertEqual(resp.status, 400)
+
+    async def test_temp_receipt_card_and_open_callback(self) -> None:
+        ctx = NS(user_data={}, args=[], bot=NS(id=42, username="subsbot"))
+        upd, replies = self._text("vless://11111111-1111-1111-1111-111111111111@hk.example.com:443#HK01")
+        await B.handle_text(upd, ctx)
+        body, kw = replies[-1]
+        self.assertIn("<blockquote>", body)
+        self.assertIn("HK01", body)
+        datas = [b.callback_data for row in kw["reply_markup"].inline_keyboard for b in row]
+        self.assertIn("temp:open", datas)
+        self.assertIn("temp:tosub", datas)
+
+        cb_upd, edits, _ = self._cb("temp:open")
+        await B.on_callback(cb_upd, ctx)
+        self.assertIn("临时节点", edits[-1][0])
+        self.assertIn("HK01", edits[-1][0])
 
 
 if __name__ == "__main__":

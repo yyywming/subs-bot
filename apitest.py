@@ -20,6 +20,7 @@ import aiohttp
 
 # Key 只允许常见字符（sk-xxx、base64、JWT 等），长度 16~512；含 :// 的是分享链接/URL，不当作 Key
 _API_KEY_RE = re.compile(r"^[A-Za-z0-9_\-.=+/:~]{16,512}$")
+_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/@-]{2,128}$")
 _URL_RE = re.compile(r"^https?://\S+$", re.I)
 _VERSION_SUFFIX_RE = re.compile(r"/v\d+[a-z0-9]*$", re.I)
 
@@ -50,34 +51,122 @@ def _is_url(token: str) -> bool:
         return False
 
 
-def parse_api_pairs(text: str) -> tuple[list[tuple[str, str]], int]:
-    """把文本解析成 [(地址, Key)]，返回 (pairs, 无法配对的片段数)。
+def _is_model_name(token: str) -> bool:
+    token = (token or "").strip()
+    if not token or "://" in token or _is_url(token):
+        return False
+    return bool(_MODEL_NAME_RE.fullmatch(token))
 
-    支持：同一行「地址 Key」「地址|Key」，或地址、Key 分两行；多组可连续书写。
+
+def _extract_model_prefix(token: str) -> str | None:
+    low = (token or "").lower()
+    for prefix in ("model=", "model:", "m="):
+        if low.startswith(prefix):
+            val = token[len(prefix):].strip()
+            return val if _is_model_name(val) else None
+    return None
+
+
+def parse_api_specs(text: str) -> tuple[list[tuple[str, str, str | None]], int]:
+    """把文本解析成 [(地址, Key, 可选指定模型)]，返回 (specs, 无法配对的片段数)。
+
+    支持：
+    - 同一行「地址 Key」「地址|Key」「地址 Key 模型名」「地址|Key|模型名」
+    - 分两行「地址\\nKey」（可选第三行「model=模型名」）
+    - 多组连续书写
     """
-    tokens = [t for t in re.split(r"[\s|，,]+", (text or "").strip()) if t]
-    pairs: list[tuple[str, str]] = []
+    specs: list[tuple[str, str, str | None]] = []
     stray = 0
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i].rstrip("。；;")
-        if _is_url(tok) and i + 1 < len(tokens) and is_api_key_like(tokens[i + 1]) and not _is_url(tokens[i + 1]):
-            pairs.append((tok, tokens[i + 1]))
-            i += 2
+    pending_url: str | None = None
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
             continue
+        # 先检查是否为整行单组：地址|Key(|模型) 或 地址 Key (模型)
+        parts = [t for t in re.split(r"[\s|，,]+", line) if t]
+        if not parts:
+            continue
+
+        # 单行刚好 3 段且格式为 URL + Key + 模型名（或 model=模型名）
+        if pending_url is None and len(parts) == 3:
+            u_tok = parts[0].rstrip("。；;")
+            m_tok = _extract_model_prefix(parts[2]) or (parts[2] if _is_model_name(parts[2]) else None)
+            if _is_url(u_tok) and is_api_key_like(parts[1]) and not _is_url(parts[1]) and m_tok:
+                specs.append((u_tok, parts[1], m_tok))
+                continue
+
+        # 其余按流式 token 配对（支持两行一组、一行多组、或紧跟 model=xxx）
+        i = 0
+        while i < len(parts):
+            tok = parts[i].rstrip("。；;")
+            if pending_url is not None:
+                if is_api_key_like(tok) and not _is_url(tok):
+                    model_opt: str | None = None
+                    if i + 1 < len(parts):
+                        explicit_m = _extract_model_prefix(parts[i + 1])
+                        if explicit_m:
+                            model_opt = explicit_m
+                            i += 1
+                    specs.append((pending_url, tok, model_opt))
+                    pending_url = None
+                    i += 1
+                    continue
+                # 前一个悬空 URL 后面跟的不是 Key
+                stray += 1
+                pending_url = None
+                continue
+
+            if _is_url(tok):
+                if i + 1 < len(parts) and is_api_key_like(parts[i + 1]) and not _is_url(parts[i + 1]):
+                    model_opt = None
+                    if i + 2 < len(parts):
+                        explicit_m = _extract_model_prefix(parts[i + 2])
+                        if explicit_m:
+                            model_opt = explicit_m
+                            i += 1
+                    specs.append((tok, parts[i + 1], model_opt))
+                    i += 2
+                    continue
+                # 行末单个 URL，等待下一行的 Key
+                if i == len(parts) - 1:
+                    pending_url = tok
+                    i += 1
+                    continue
+                stray += 1
+                i += 1
+                continue
+
+            # 紧跟在上一组后的独立 `model=xxx`
+            explicit_m = _extract_model_prefix(tok)
+            if explicit_m and specs and specs[-1][2] is None:
+                u0, k0, _ = specs[-1]
+                specs[-1] = (u0, k0, explicit_m)
+                i += 1
+                continue
+
+            stray += 1
+            i += 1
+
+    if pending_url is not None:
         stray += 1
-        i += 1
-    return pairs, stray
+    return specs, stray
+
+
+def parse_api_pairs(text: str) -> tuple[list[tuple[str, str]], int]:
+    """把文本解析成 [(地址, Key)]，返回 (pairs, 无法配对的片段数)。"""
+    specs, stray = parse_api_specs(text)
+    return [(u, k) for u, k, _ in specs], stray
 
 
 def looks_like_api_test(text: str) -> bool:
-    """未进入 /ai 模式时，判断一条消息是不是「地址 + Key」。
+    """未进入 /ai 模式时，判断一条消息是不是「地址 + Key（+ 可选模型）」。
 
     要求整条消息恰好由若干组「地址 Key」组成，没有多余内容；
     纯订阅链接、「名称|链接」、带说明文字的链接都不会被误判。
     """
-    pairs, stray = parse_api_pairs(text)
-    return bool(pairs) and stray == 0 and len(pairs) <= MAX_API_PAIRS
+    specs, stray = parse_api_specs(text)
+    return bool(specs) and stray == 0 and len(specs) <= MAX_API_PAIRS
 
 
 def normalize_api_base(url: str) -> str:
@@ -236,14 +325,18 @@ async def probe_api(
             session, "GET", models_url, headers=headers, limit=MAX_MODELS_BYTES, timeout=models_timeout,
         )
         result["status"] = status
-        if 300 <= status < 400:
-            result["message"] = f"接口返回重定向，请填写最终 API 地址（HTTP {status}）"
+        models: list[str] = []
+        if status == 200:
+            models = _model_ids(payload)
+            result["models"] = models
+        elif not model:
+            # 未指定模型时，/models 失败就直接报错；指定了模型则允许继续直连 /chat/completions
+            if 300 <= status < 400:
+                result["message"] = f"接口返回重定向，请填写最终 API 地址（HTTP {status}）"
+            else:
+                result["message"] = f"{_extract_error(payload, text)}（HTTP {status}）"
             return result
-        if status != 200:
-            result["message"] = f"{_extract_error(payload, text)}（HTTP {status}）"
-            return result
-        models = _model_ids(payload)
-        result["models"] = models
+
         test_model = pick_test_model(models, model)
         result["model"] = test_model
         if not test_model:
