@@ -156,6 +156,17 @@ class Store:
     调用方签名不变，22 个使用点零改动。
     """
 
+    _PROTOCOL_ALIASES: dict[str, tuple[str, ...]] = {
+        "ss": ("ss", "shadowsocks"),
+        "shadowsocks": ("ss", "shadowsocks"),
+        "ssr": ("ssr", "shadowsocksr"),
+        "shadowsocksr": ("ssr", "shadowsocksr"),
+        "hy2": ("hy2", "hysteria2"),
+        "hysteria2": ("hy2", "hysteria2"),
+        "wg": ("wg", "wireguard"),
+        "wireguard": ("wg", "wireguard"),
+    }
+
     def __init__(self, path: str | None = None) -> None:
         self.path = str(path or DB_PATH)
         self._conn: aiosqlite.Connection | None = None
@@ -347,6 +358,73 @@ class Store:
             cur = await db.execute("SELECT * FROM subscriptions WHERE token=?", (token,))
             row = await cur.fetchone()
             return dict(row) if row else None
+
+    async def search_sub_node_matches(
+        self, user_id: int, terms: list[str]
+    ) -> dict[str, set[int]]:
+        """在 SQLite 内部按节点名称、服务器与协议匹配订阅，仅返回命中 id 集合。"""
+        clean_terms: list[str] = []
+        seen: set[str] = set()
+        for raw in terms:
+            term = str(raw or "").strip().lower()
+            if not term or term in seen:
+                continue
+            seen.add(term)
+            clean_terms.append(term)
+            if len(clean_terms) >= 8:
+                break
+        if not clean_terms:
+            return {}
+
+        results: dict[str, set[int]] = {}
+        async with self.connection() as db:
+            use_json = True
+            for term in clean_terms:
+                if use_json:
+                    aliases = self._PROTOCOL_ALIASES.get(term)
+                    if aliases:
+                        placeholders = ", ".join("?" for _ in aliases)
+                        type_clause = f"lower(coalesce(json_extract(j.value, '$.type'), '')) IN ({placeholders})"
+                        type_params: tuple[Any, ...] = aliases
+                    elif len(term) >= 3:
+                        type_clause = "instr(lower(coalesce(json_extract(j.value, '$.type'), '')), ?) > 0"
+                        type_params = (term,)
+                    else:
+                        # 短协议词（如仅 1-2 字符且非别名）走精确相等，防止误伤长协议名
+                        type_clause = "lower(coalesce(json_extract(j.value, '$.type'), '')) = ?"
+                        type_params = (term,)
+
+                    sql = f"""SELECT id FROM subscriptions
+                              WHERE user_id = ?
+                                AND nodes_json IS NOT NULL AND nodes_json != '' AND nodes_json != '[]'
+                                AND json_valid(nodes_json)
+                                AND json_type(nodes_json) = 'array'
+                                AND EXISTS (
+                                  SELECT 1 FROM json_each(nodes_json) AS j
+                                  WHERE instr(lower(coalesce(json_extract(j.value, '$.name'), '')), ?) > 0
+                                     OR instr(lower(coalesce(json_extract(j.value, '$.server'), '')), ?) > 0
+                                     OR {type_clause}
+                                )"""
+                    params: tuple[Any, ...] = (user_id, term, term, *type_params)
+                    try:
+                        cur = await db.execute(sql, params)
+                        rows = await cur.fetchall()
+                        results[term] = {int(r["id"]) for r in rows}
+                        continue
+                    except Exception as exc:
+                        log.warning("json1 node search unavailable (%s), falling back to instr", exc)
+                        use_json = False
+
+                cur = await db.execute(
+                    """SELECT id FROM subscriptions
+                       WHERE user_id = ?
+                         AND nodes_json IS NOT NULL AND nodes_json != '' AND nodes_json != '[]'
+                         AND instr(lower(nodes_json), ?) > 0""",
+                    (user_id, term),
+                )
+                rows = await cur.fetchall()
+                results[term] = {int(r["id"]) for r in rows}
+        return results
 
     async def add_sub(self, user_id: int, name: str, url: str) -> dict[str, Any]:
         now = int(time.time())

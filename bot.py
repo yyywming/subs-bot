@@ -9,6 +9,7 @@ import re
 import signal
 import time
 from contextlib import suppress
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, quote_plus, urlparse
 
@@ -206,14 +207,14 @@ def is_valid_http_url(url: str, max_len: int = 2048) -> bool:
 HOME_INLINE_KB = InlineKeyboardMarkup([
     [
         InlineKeyboardButton("📦 订阅列表", callback_data="menu:list"),
+        InlineKeyboardButton("🔍 搜索订阅", callback_data="menu:search"),
+    ],
+    [
         InlineKeyboardButton("🟠 临期列表", callback_data="menu:expire"),
-    ],
-    [
         InlineKeyboardButton("📤 导出链接", callback_data="menu:export"),
-        InlineKeyboardButton("🔄 更新所有", callback_data="menu:updateall"),
     ],
     [
-        InlineKeyboardButton("🔢 重置编号", callback_data="menu:renumber"),
+        InlineKeyboardButton("🔄 更新所有", callback_data="menu:updateall"),
         InlineKeyboardButton("♻️ 撤销删除", callback_data="menu:recycle"),
     ],
     [
@@ -676,7 +677,14 @@ def detail_text(sub: dict[str, Any], idx: int) -> str:
     )
 
 
-def detail_keyboard(sub_id: int, page: int = 0, node_count: int = 0) -> InlineKeyboardMarkup:
+def detail_keyboard(
+    sub_id: int,
+    page: int = 0,
+    node_count: int = 0,
+    *,
+    back_cb: str | None = None,
+    back_label: str = "⬅️ 返回列表",
+) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton("Clash Meta", callback_data=f"sub:fmt:{sub_id}:clash"),
@@ -704,7 +712,7 @@ def detail_keyboard(sub_id: int, page: int = 0, node_count: int = 0) -> InlineKe
         ])
     rows.append([
         InlineKeyboardButton("🗑 删除订阅", callback_data=f"sub:delask:{sub_id}:{page}"),
-        InlineKeyboardButton("⬅️ 返回列表", callback_data=f"sub:back:{page}"),
+        InlineKeyboardButton(back_label, callback_data=back_cb or f"sub:back:{page}"),
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -752,7 +760,10 @@ def list_keyboard(
         InlineKeyboardButton("🔢 跳转页", callback_data="list:jump"),
         InlineKeyboardButton("🔄 更新所有", callback_data="list:updateall"),
     ])
-    rows.append([InlineKeyboardButton("🏠 主菜单", callback_data="list:home")])
+    rows.append([
+        InlineKeyboardButton("🔍 搜索订阅", callback_data="search:ask"),
+        InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -979,8 +990,8 @@ def render_help_text(bot: Any = None) -> str:
         "• /export — 全部订阅与临时节点聚合去重导出\n"
         "• /temp — 管理临时节点（单删 / 一键转正式订阅）\n"
         "• /path 关键词 名称 — 节点路径映射（<code>/path clear</code> 清空）\n"
-        "• /s 关键词 — 搜索订阅并直达详情\n"
-        "• /o 关键词 — 聚合导出搜索结果\n"
+        "• /s [关键词] — 搜索订阅（支持多词 / -排除 / 节点 / 状态筛选）\n"
+        "• /o [关键词] — 聚合导出搜索结果（含多词与节点筛选）\n"
         "• /d 关键词 — 删除匹配订阅（可回收站恢复）\n"
         "• /ai [地址 Key 模型] — 批量测试 API 可用性\n"
         "• /g 关键词 — 搜索 GitHub 仓库与公开代码\n"
@@ -1595,74 +1606,453 @@ async def cmd_api_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def cmd_search_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await deny(update):
-        return
-    q = " ".join(context.args or []).strip().lower()
-    # 先用瘦行筛选，再只回取命中的完整节点数据。否则搜一个普通订阅也会先把
-    # 其它巨型订阅的几十 MB nodes_json 全搬进内存。
-    subs = await store.list_subs_meta(scope_owner(update))
-    hits = [s for s in subs if not q or q in f"{s['name']} {s['url']}".lower()]
+SEARCH_PRESETS: dict[str, str] = {
+    "valid": "🟢 正常可用",
+    "soon": "🟠 即将到期",
+    "dead": "🔴 过期/耗尽",
+    "failed": "⚠️ 刷新异常",
+    "uploaded": "📄 本地导入",
+    "longterm": "✨ 长期有效",
+}
+
+_CN_STATUS_ALIASES: dict[str, str] = {
+    "正常": "valid",
+    "有效": "valid",
+    "可用": "valid",
+    "临期": "soon",
+    "即将到期": "soon",
+    "过期": "expired",
+    "已过期": "expired",
+    "耗尽": "drained",
+    "流量耗尽": "drained",
+    "无流量": "drained",
+    "失效": "broken",
+    "异常": "failed",
+    "失败": "failed",
+    "报错": "failed",
+    "本地": "uploaded",
+    "导入": "uploaded",
+    "本地导入": "uploaded",
+    "长期": "longterm",
+    "永久": "longterm",
+    "长期有效": "longterm",
+}
+
+_EXPLICIT_STATUS_ALIASES: dict[str, str] = {
+    **{
+        k: k
+        for k in (
+            "valid",
+            "soon",
+            "expired",
+            "drained",
+            "dead",
+            "broken",
+            "failed",
+            "uploaded",
+            "longterm",
+        )
+    },
+    **_CN_STATUS_ALIASES,
+}
+
+
+@dataclass
+class SearchQuery:
+    include_terms: list[str] = field(default_factory=list)
+    exclude_terms: list[str] = field(default_factory=list)
+    required_statuses: set[str] = field(default_factory=set)
+    exclude_statuses: set[str] = field(default_factory=set)
+    soft_status_terms: list[tuple[str, str]] = field(default_factory=list)
+    preset_key: str | None = None
+
+
+def _sub_status_flags(sub: dict[str, Any], now: int | None = None) -> set[str]:
+    """计算订阅的状态标签集合，与列表状态图标及详情徽章规则保持一致。"""
+    ts = int(time.time()) if now is None else int(now)
+    exp = sub.get("expire_at")
+    exp_int = int(exp) if exp is not None else None
+    remain = remain_traffic_gb(sub)
+    url = str(sub.get("url") or "")
+
+    is_failed = bool(sub.get("last_error"))
+    is_uploaded = url.startswith("uploaded://")
+    is_expired = exp_int is not None and 0 < exp_int < ts
+    is_drained = remain is not None and remain <= 0.001
+    is_soon = exp_int is not None and exp_int > 0 and 0 <= exp_int - ts <= 14 * 86400
+    is_longterm = exp_int is None or exp_int <= 0 or (exp_int - ts > 10 * 365 * 86400)
+
+    flags: set[str] = set()
+    if is_failed:
+        flags.add("failed")
+    if is_uploaded:
+        flags.add("uploaded")
+    if is_expired:
+        flags.add("expired")
+    if is_drained:
+        flags.add("drained")
+    if is_expired or is_drained:
+        flags.add("dead")
+    if is_failed or is_expired or is_drained:
+        flags.add("broken")
+    if is_soon:
+        flags.add("soon")
+    if is_longterm:
+        flags.add("longterm")
+    if not is_failed and not is_expired and not is_drained:
+        flags.add("valid")
+    return flags
+
+
+def _extract_status_token(token: str) -> str | None:
+    for prefix in ("is:", "status:", "#"):
+        if token.startswith(prefix):
+            key = token[len(prefix):]
+            return _EXPLICIT_STATUS_ALIASES.get(key) if key else None
+    return None
+
+
+def parse_search_query(raw: str) -> SearchQuery:
+    """解析多词 AND、-排除词、显式状态（is:/#）与中文状态软筛选。"""
+    parsed = SearchQuery()
+    tokens = str(raw or "").split()
+    soft_seen: set[tuple[str, str]] = set()
+    for tok in tokens:
+        low = tok.strip().lower()
+        if not low:
+            continue
+        if low.startswith("-") and len(low) > 1:
+            rest = low[1:]
+            st = _extract_status_token(rest)
+            if st:
+                parsed.exclude_statuses.add(st)
+                continue
+            if rest not in parsed.exclude_terms:
+                parsed.exclude_terms.append(rest)
+            if rest in _CN_STATUS_ALIASES:
+                parsed.exclude_statuses.add(_CN_STATUS_ALIASES[rest])
+            continue
+
+        st = _extract_status_token(low)
+        if st:
+            parsed.required_statuses.add(st)
+            if len(tokens) == 1 and low.startswith("is:") and low[3:] in SEARCH_PRESETS:
+                parsed.preset_key = low[3:]
+            continue
+
+        if low in _CN_STATUS_ALIASES:
+            pair = (low, _CN_STATUS_ALIASES[low])
+            if pair not in soft_seen:
+                soft_seen.add(pair)
+                parsed.soft_status_terms.append(pair)
+            continue
+
+        if low not in parsed.include_terms:
+            parsed.include_terms.append(low)
+    return parsed
+
+
+async def search_subs(
+    user_id: int, raw_query: str, sort_mode: str = "默认"
+) -> list[tuple[int, dict[str, Any], bool]]:
+    """检索个人订阅：先瘦查询筛选元信息与状态，再借助 SQLite 内部匹配节点内容。"""
+    raw_subs = await store.list_subs_meta(user_id)
+    if not raw_subs:
+        return []
+    index_of = stable_index_map(raw_subs)
+    ordered = sort_subs(raw_subs, sort_mode)
+    parsed = parse_search_query(raw_query)
+
+    if not (
+        parsed.include_terms
+        or parsed.exclude_terms
+        or parsed.required_statuses
+        or parsed.exclude_statuses
+        or parsed.soft_status_terms
+    ):
+        return [(index_of.get(int(s["id"]), int(s["id"])), s, False) for s in ordered]
+
+    node_terms = list(parsed.include_terms) + [lit for lit, _ in parsed.soft_status_terms]
+    node_hits = await store.search_sub_node_matches(user_id, node_terms) if node_terms else {}
+    now = int(time.time())
+    matches: list[tuple[int, dict[str, Any], bool]] = []
+
+    for sub in ordered:
+        sid = int(sub["id"])
+        meta_blob = f"{sub.get('name') or ''} {sub.get('url') or ''}".lower()
+        flags = _sub_status_flags(sub, now)
+
+        if parsed.required_statuses and not parsed.required_statuses.issubset(flags):
+            continue
+        if parsed.exclude_statuses and (parsed.exclude_statuses & flags):
+            continue
+        if any(ex in meta_blob for ex in parsed.exclude_terms):
+            continue
+
+        matched_by_node = False
+        ok = True
+        for term in parsed.include_terms:
+            if term in meta_blob:
+                continue
+            if sid in node_hits.get(term, ()):
+                matched_by_node = True
+                continue
+            ok = False
+            break
+        if not ok:
+            continue
+
+        for lit, flag in parsed.soft_status_terms:
+            if flag in flags or lit in meta_blob:
+                continue
+            if sid in node_hits.get(lit, ()):
+                matched_by_node = True
+                continue
+            ok = False
+            break
+        if not ok:
+            continue
+
+        matches.append((index_of.get(sid, sid), sub, matched_by_node))
+    return matches
+
+
+def _preset_buttons_rows() -> list[list[InlineKeyboardButton]]:
+    grid = (("valid", "soon"), ("dead", "failed"), ("uploaded", "longterm"))
+    return [
+        [InlineKeyboardButton(SEARCH_PRESETS[key], callback_data=f"search:preset:{key}") for key in pair]
+        for pair in grid
+    ]
+
+
+def render_search_prompt(notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    head = f"{html.escape(notice)}\n\n" if notice else ""
+    text = (
+        f"{head}"
+        "🔍 <b>搜索订阅</b>\n"
+        "请直接发送搜索关键词，或点击下方状态一键筛选：\n"
+        "<blockquote>"
+        "• <b>多词组合</b>：空格分隔同时满足，如 <code>香港 vless</code>\n"
+        "• <b>排除条件</b>：前缀加减号，如 <code>机场 -过期 -备用</code>\n"
+        "• <b>节点检索</b>：支持节点名称、域名与协议（如 <code>IEPL</code> / <code>hy2</code>）\n"
+        "• <b>状态关键词</b>：支持 <code>正常</code> / <code>临期</code> / <code>过期</code> / <code>耗尽</code> / <code>异常</code>"
+        "</blockquote>"
+    )
+    rows = _preset_buttons_rows()
+    rows.append([
+        InlineKeyboardButton("📦 订阅列表", callback_data="menu:list"),
+        InlineKeyboardButton("❌ 取消", callback_data="menu:cancel"),
+    ])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def render_search_page(
+    user_id: int,
+    query: str,
+    page: int = 0,
+    sort_mode: str = "默认",
+    *,
+    banner: str = "",
+) -> tuple[str, InlineKeyboardMarkup]:
+    parsed = parse_search_query(query)
+    if parsed.preset_key and parsed.preset_key in SEARCH_PRESETS:
+        display_query = SEARCH_PRESETS[parsed.preset_key]
+    else:
+        display_query = truncate_utf16(query.strip(), 80) or "全部订阅"
+
+    hits = await search_subs(user_id, query, sort_mode=sort_mode)
+    banner_block = f"{banner}\n\n" if banner else ""
     if not hits:
-        await update.effective_message.reply_text("没有匹配订阅。", reply_markup=MAIN_KB)
-        return
-    nodes = []
-    for hit in hits:
-        sub = await store.get_sub(scope_owner(update), int(hit["id"]))
-        if sub is not None:
-            nodes.extend(nodes_of(sub))
+        text = (
+            f"{banner_block}"
+            f"🔍 <b>搜索结果</b>（{html.escape(display_query)}）\n"
+            "<blockquote>没有匹配订阅。\n"
+            "可尝试更换关键词、减少筛选条件，或点击下方常用筛选：</blockquote>"
+        )
+        rows = [
+            [
+                InlineKeyboardButton(SEARCH_PRESETS["valid"], callback_data="search:preset:valid"),
+                InlineKeyboardButton(SEARCH_PRESETS["soon"], callback_data="search:preset:soon"),
+                InlineKeyboardButton(SEARCH_PRESETS["dead"], callback_data="search:preset:dead"),
+            ],
+            [
+                InlineKeyboardButton("🔍 重新搜索", callback_data="search:ask"),
+                InlineKeyboardButton("📦 订阅列表", callback_data="menu:list"),
+                InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+            ],
+        ]
+        return text, InlineKeyboardMarkup(rows)
+
+    total_hits = len(hits)
+    total_nodes = sum(int(sub.get("node_count") or 0) for _, sub, _ in hits)
+    known_remains = [r for _, sub, _ in hits if (r := remain_traffic_gb(sub)) is not None]
+    total_remain_str = format_bytes_gb(sum(known_remains)) if known_remains else "未知"
+    node_hit_count = sum(1 for _, _, by_node in hits if by_node)
+
+    page_size = 8
+    total_pages = max(1, (total_hits + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    chunk = hits[start : start + page_size]
+
+    stats_lines = [
+        f"条件: <code>{html.escape(display_query)}</code> ｜ 排序: <b>{html.escape(sort_mode)}</b>",
+        f"命中: <b>{total_hits}</b> 条 ｜ 总节点: <b>{total_nodes}</b> ｜ 总剩余: <b>{html.escape(total_remain_str)}</b>",
+    ]
+    if node_hit_count > 0:
+        stats_lines.append(f"其中 <b>{node_hit_count}</b> 条通过内部节点内容匹配（标有 📡节点命中）")
+
+    header = (
+        f"{banner_block}"
+        f"🔍 <b>搜索结果</b>（第 {page + 1}/{total_pages} 页）\n"
+        f"<blockquote>{chr(10).join(stats_lines)}</blockquote>\n\n"
+    )
+    entry_blocks: list[str] = []
+    used_chars = _utf16_len(header)
+    budget = TG_SAFE_BODY - 120
+    for idx, sub, by_node in chunk:
+        nc = int(sub.get("node_count") or 0)
+        tag = " · 📡节点命中" if by_node else ""
+        block = f"{sub_summary_line(idx, sub)} · {nc} 节点{tag}"
+        cost = _utf16_len(block) + 2
+        if entry_blocks and used_chars + cost > budget:
+            break
+        entry_blocks.append(block)
+        used_chars += cost
+    omitted = len(chunk) - len(entry_blocks)
+    footer = f"\n\n<i>（当前页另有 {omitted} 条未展开，可直接点击下方按钮查看）</i>" if omitted > 0 else ""
+    text = header + "\n\n".join(entry_blocks) + footer
+
+    kb_rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                list_button_label(idx, sub),
+                callback_data=f"search:open:{int(sub['id'])}:{page}",
+            )
+        ]
+        for idx, sub, _ in chunk
+    ]
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"search:page:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+        if page + 1 < total_pages:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"search:page:{page + 1}"))
+        kb_rows.append(nav)
+    kb_rows.append([
+        InlineKeyboardButton(f"🔀 排序:{sort_mode}", callback_data=f"search:sort:{page}"),
+        InlineKeyboardButton("📤 导出结果", callback_data="search:export"),
+        InlineKeyboardButton("🔄 刷新命中", callback_data="search:refresh"),
+    ])
+    kb_rows.append([
+        InlineKeyboardButton("🔍 换词搜索", callback_data="search:ask"),
+        InlineKeyboardButton("📦 订阅列表", callback_data="menu:list"),
+        InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+    ])
+    return text, InlineKeyboardMarkup(kb_rows)
+
+
+async def render_search_export(
+    user_id: int, query: str, *, back_to_search: bool = False
+) -> tuple[str, InlineKeyboardMarkup]:
+    clean_q = query.strip()
+    if clean_q:
+        hits = await search_subs(user_id, clean_q, sort_mode="默认")
+        hit_subs = [sub for _, sub, _ in hits]
+    else:
+        hit_subs = await store.list_subs_meta(user_id)
+
+    fallback_kb = (
+        InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ 返回搜索", callback_data="search:page:0"),
+            InlineKeyboardButton("🔍 换词搜索", callback_data="search:ask"),
+        ]])
+        if back_to_search
+        else MAIN_KB
+    )
+    if not hit_subs:
+        return "没有匹配订阅。", fallback_kb
+
+    sub_ids = [int(hit["id"]) for hit in hit_subs]
+    nodes = await mapped_nodes_for_user(user_id, sub_ids, dedup=True)
     if not nodes:
-        await update.effective_message.reply_text("匹配订阅暂无可导出节点。", reply_markup=MAIN_KB)
-        return
+        return "匹配订阅暂无可导出节点。", fallback_kb
+
     code = await store.create_short(
-        scope_owner(update),
-        "aggregate://ids/" + ",".join(str(int(hit["id"])) for hit in hits),
+        user_id,
+        "aggregate://ids/" + ",".join(str(sid) for sid in sub_ids),
     )
     clash_url = f"{PUBLIC_BASE_URL}/agg/{code}/clash"
     singbox_url = f"{PUBLIC_BASE_URL}/agg/{code}/singbox"
     base64_url = f"{PUBLIC_BASE_URL}/agg/{code}/base64"
-    await update.effective_message.reply_html(
-        f"📦 <b>搜索导出完成</b>：{len(hits)} 个订阅，{len(nodes)} 个节点\n\n"
+    surge_url = f"{PUBLIC_BASE_URL}/agg/{code}/surge"
+    qx_url = f"{PUBLIC_BASE_URL}/agg/{code}/qx"
+    parsed = parse_search_query(clean_q)
+    if parsed.preset_key and parsed.preset_key in SEARCH_PRESETS:
+        cond_label = SEARCH_PRESETS[parsed.preset_key]
+    else:
+        cond_label = truncate_utf16(clean_q, 60) if clean_q else "全部订阅"
+
+    text = (
+        f"📦 <b>搜索导出完成</b>\n"
+        f"<blockquote>条件: <code>{html.escape(cond_label)}</code> ｜ 命中订阅: <b>{len(hit_subs)}</b> 个\n"
+        f"导出节点: <b>{len(nodes)}</b>（已去重）｜ 协议: <code>{html.escape(_protocol_summary(nodes))}</code></blockquote>\n\n"
         f"Clash Meta:\n<code>{html.escape(clash_url)}</code>\n"
         f"Sing-box:\n<code>{html.escape(singbox_url)}</code>\n"
-        f"Base64:\n<code>{html.escape(base64_url)}</code>",
-        reply_markup=_export_copy_keyboard(code),
+        f"Base64:\n<code>{html.escape(base64_url)}</code>\n"
+        f"Surge:\n<code>{html.escape(surge_url)}</code>\n"
+        f"QX:\n<code>{html.escape(qx_url)}</code>\n\n"
+        f"短链码: <code>{html.escape(code)}</code>"
+    )
+    kb = _export_copy_keyboard(code)
+    if back_to_search:
+        rows = [list(row) for row in kb.inline_keyboard]
+        rows.append([
+            InlineKeyboardButton("⬅️ 返回搜索", callback_data="search:page:0"),
+            InlineKeyboardButton("🔍 换词搜索", callback_data="search:ask"),
+        ])
+        kb = InlineKeyboardMarkup(rows)
+    return text, kb
+
+
+async def cmd_search_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await deny(update):
+        return
+    q = " ".join(getattr(context, "args", None) or []).strip()
+    text, kb = await render_search_export(scope_owner(update), q)
+    await update.effective_message.reply_html(
+        text,
+        reply_markup=kb,
         disable_web_page_preview=True,
     )
-
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
-    q = " ".join(context.args or []).strip()
+    q = " ".join(getattr(context, "args", None) or []).strip()
+    scoped = interaction_data(update, context)
     if not q:
-        await update.effective_message.reply_text("用法：/s 关键词", reply_markup=MAIN_KB)
+        scoped["await"] = "sub_search"
+        text, kb = render_search_prompt()
+        await update.effective_message.reply_html(
+            text,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
         return
-    subs = await store.list_subs_meta(scope_owner(update))
-    hits: list[str] = []
-    kb_rows: list[list[InlineKeyboardButton]] = []
-    for i, sub in enumerate(subs, start=1):
-        blob = f"{sub['name']} {sub['url']}".lower()
-        if q.lower() in blob:
-            hits.append(sub_summary_line(i, sub))
-            if len(kb_rows) < 8:
-                kb_rows.append([
-                    InlineKeyboardButton(
-                        list_button_label(i, sub),
-                        callback_data=f"sub:open:{int(sub['id'])}:0",
-                    )
-                ])
-    if not hits:
-        await update.effective_message.reply_text("没有匹配订阅。", reply_markup=MAIN_KB)
-        return
-    kb_rows.append([
-        InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
-        InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
-    ])
+    scoped.pop("await", None)
+    scoped["search_query"] = q
+    text, kb = await render_search_page(
+        scope_owner(update),
+        q,
+        0,
+        sort_mode=_current_sort_mode(context),
+    )
     await update.effective_message.reply_html(
-        f"🔍 <b>搜索结果</b>（共 {len(hits)} 条）\n\n" + "\n\n".join(hits[:15]),
-        reply_markup=InlineKeyboardMarkup(kb_rows),
+        text,
+        reply_markup=kb,
         disable_web_page_preview=True,
     )
 
@@ -1977,7 +2367,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     state = scoped.get("await")
     # ReplyKeyboard 菜单按钮优先级最高：点击菜单时取消正在等待的输入。
     menu_texts = {
-        "📦 订阅列表", "📋 订阅列表", "订阅列表", "⏳ 临期列表", "🟠 临期列表",
+        "📦 订阅列表", "📋 订阅列表", "订阅列表", "🔍 搜索订阅", "搜索订阅",
+        "⏳ 临期列表", "🟠 临期列表",
         "临期列表", "🔗 短链", "短链", "📦 导出", "📤 导出链接", "导出", "导出链接",
         "🔄 更新所有", "更新所有", "🔢 重置编号", "重置编号", "♻️ 撤销删除", "撤销删除",
         "🧪 临时节点", "临时节点", "🧭 路径对应", "路径对应", "❓ 帮助菜单", "帮助菜单", "帮助",
@@ -2088,6 +2479,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    # ── 搜索订阅状态机 ─────────────────────────────
+    if state == "sub_search":
+        scoped.pop("await", None)
+        query = text.strip()
+        if not query:
+            scoped["await"] = "sub_search"
+            prompt_text, prompt_kb = render_search_prompt("⚠️ 关键词不能为空，请重新输入或选择快捷筛选。")
+            await update.effective_message.reply_html(
+                prompt_text, reply_markup=prompt_kb, disable_web_page_preview=True
+            )
+            return
+        scoped["search_query"] = query
+        res_text, res_kb = await render_search_page(
+            user_id, query, 0, sort_mode=_current_sort_mode(context)
+        )
+        await update.effective_message.reply_html(
+            res_text, reply_markup=res_kb, disable_web_page_preview=True
+        )
+        return
+
     # ── /ai API 测试状态机 ─────────────────────────
     if state == "api_test":
         scoped.pop("await", None)
@@ -2116,6 +2527,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if text in ("📦 订阅列表", "📋 订阅列表", "订阅列表"):
         return await cmd_list(update, context)
+    if text in ("🔍 搜索订阅", "搜索订阅"):
+        return await cmd_search(update, context)
     if text in ("⏳ 临期列表", "🟠 临期列表", "临期列表"):
         return await cmd_expire(update, context)
     if text in ("🔗 短链", "短链"):
@@ -2470,6 +2883,12 @@ async def _edit_or_reply_html(
             )
 
 
+async def _reply_search_expired(q: Any, scoped: dict[str, Any]) -> None:
+    scoped["await"] = "sub_search"
+    text, kb = render_search_prompt("⚠️ 当前搜索会话已过期，请重新输入关键词或选择快捷筛选。")
+    await _edit_or_reply_html(q, text, kb)
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not q:
@@ -2601,6 +3020,124 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if data == "menu:list":
         text, kb = await render_list(user_id, 0, sort_mode=_current_sort_mode(context))
+        await _edit_or_reply_html(q, text, kb)
+        return
+    if data in ("menu:search", "search:ask"):
+        interaction_data(update, context)["await"] = "sub_search"
+        text, kb = render_search_prompt()
+        await _edit_or_reply_html(q, text, kb)
+        return
+    if data.startswith("search:preset:"):
+        key = data.split(":", 2)[-1]
+        if key not in SEARCH_PRESETS:
+            return
+        scoped = interaction_data(update, context)
+        scoped.pop("await", None)
+        query = f"is:{key}"
+        scoped["search_query"] = query
+        text, kb = await render_search_page(
+            user_id, query, 0, sort_mode=_current_sort_mode(context)
+        )
+        await _edit_or_reply_html(q, text, kb)
+        return
+    if data.startswith("search:page:"):
+        raw_p = data.split(":", 2)[-1]
+        page = int(raw_p) if is_ascii_digits(raw_p) else 0
+        scoped = interaction_data(update, context)
+        query = str(scoped.get("search_query") or "").strip()
+        if not query:
+            await _reply_search_expired(q, scoped)
+            return
+        text, kb = await render_search_page(
+            user_id, query, page, sort_mode=_current_sort_mode(context)
+        )
+        await _edit_or_reply_html(q, text, kb)
+        return
+    if data.startswith("search:sort:"):
+        raw_p = data.split(":", 2)[-1]
+        page = int(raw_p) if is_ascii_digits(raw_p) else 0
+        scoped = interaction_data(update, context)
+        query = str(scoped.get("search_query") or "").strip()
+        if not query:
+            await _reply_search_expired(q, scoped)
+            return
+        cur_mode = _current_sort_mode(context)
+        next_mode = SORT_MODES[(SORT_MODES.index(cur_mode) + 1) % len(SORT_MODES)]
+        if context.user_data is None:
+            context.user_data = {}
+        context.user_data["sort_mode"] = next_mode
+        text, kb = await render_search_page(user_id, query, page, sort_mode=next_mode)
+        await _edit_or_reply_html(q, text, kb)
+        return
+    if data.startswith("search:open:"):
+        parts = data.split(":")
+        sub_id = int(parts[2])
+        s_page = int(parts[3]) if len(parts) > 3 and is_ascii_digits(parts[3]) else 0
+        sub = await store.get_sub(user_id, sub_id)
+        if not sub:
+            await _edit_or_reply_html(q, "订阅不存在", MAIN_KB)
+            return
+        if not nodes_of(sub):
+            sub = await refresh_sub(user_id, sub, rename=False)
+        raw_subs = await store.list_subs_meta(user_id)
+        idx = stable_index_map(raw_subs).get(sub_id, sub_id)
+        await _edit_or_reply_html(
+            q,
+            detail_text(sub, idx),
+            detail_keyboard(
+                sub_id,
+                0,
+                len(nodes_of(sub)),
+                back_cb=f"search:page:{s_page}",
+                back_label="⬅️ 返回搜索",
+            ),
+        )
+        return
+    if data == "search:export":
+        scoped = interaction_data(update, context)
+        query = str(scoped.get("search_query") or "").strip()
+        if not query:
+            await _reply_search_expired(q, scoped)
+            return
+        with suppress(Exception):
+            await q.edit_message_text("📤 正在汇总命中订阅的节点并生成导出链接…")
+        text, kb = await render_search_export(user_id, query, back_to_search=True)
+        await _edit_or_reply_html(q, text, kb)
+        return
+    if data == "search:refresh":
+        scoped = interaction_data(update, context)
+        query = str(scoped.get("search_query") or "").strip()
+        if not query:
+            await _reply_search_expired(q, scoped)
+            return
+        sort_mode = _current_sort_mode(context)
+        hits = await search_subs(user_id, query, sort_mode=sort_mode)
+        if not hits:
+            text, kb = await render_search_page(user_id, query, 0, sort_mode=sort_mode)
+            await _edit_or_reply_html(q, text, kb)
+            return
+        with suppress(Exception):
+            await q.edit_message_text(f"🔄 正在刷新命中的 {len(hits)} 条订阅，请稍候…")
+        sem = asyncio.Semaphore(max(1, UPDATE_CONCURRENCY))
+
+        async def _refresh_hit(sub_row: dict[str, Any]) -> dict[str, Any]:
+            try:
+                async with sem:
+                    return await refresh_sub(user_id, sub_row, rename=False, meta_only=True)
+            except Exception as exc:
+                log.warning("search refresh failed for #%s: %s", sub_row.get("id"), exc)
+                return {**sub_row, "last_error": str(exc)}
+
+        refreshed = await asyncio.gather(*(_refresh_hit(sub) for _, sub, _ in hits))
+        ok_cnt = sum(1 for item in refreshed if not item.get("last_error"))
+        fail_cnt = len(refreshed) - ok_cnt
+        banner = (
+            f"🔄 <b>已刷新命中的 {len(refreshed)} 条订阅</b>"
+            f"（✅ 成功 {ok_cnt} ｜ ❌ 失败 {fail_cnt}）"
+        )
+        text, kb = await render_search_page(
+            user_id, query, 0, sort_mode=sort_mode, banner=banner
+        )
         await _edit_or_reply_html(q, text, kb)
         return
     if data == "menu:expire":
@@ -3500,23 +4037,27 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await iq.answer(results, cache_time=1, is_personal=True)
         return
 
-    q = raw_query.lower()
     sort_mode = _current_sort_mode(context)
-    raw_subs = await store.list_subs_meta(user_id)
-    index_of = stable_index_map(raw_subs)
-    subs = sort_subs(raw_subs, sort_mode)
+    if raw_query.strip():
+        matched_subs = await search_subs(user_id, raw_query, sort_mode=sort_mode)
+        sub_pairs = [(idx, sub) for idx, sub, _ in matched_subs]
+    else:
+        raw_subs = await store.list_subs_meta(user_id)
+        index_of = stable_index_map(raw_subs)
+        sub_pairs = [
+            (index_of.get(int(s["id"]), int(s["id"])), s)
+            for s in sort_subs(raw_subs, sort_mode)
+        ]
+
     results: list[InlineQueryResultArticle] = []
-    for sub in subs:
-        blob = f"{sub['name']} {sub['url']}".lower()
-        if q and q not in blob:
-            continue
+    for display_idx, sub in sub_pairs:
         remain = remain_traffic_gb(sub)
         remain_s = f"{remain:.2f}GB" if remain is not None else "?GB"
         days = remain_text(sub.get("expire_at"))
         if days == "长期有效":
             days = "长期"
         # 标题编号与列表/私聊数字编号一致（按 id 顺序的序号），而不是数据库自增 id
-        title = f"#{index_of.get(int(sub['id']), int(sub['id']))} {sub['name']} [{remain_s}] {days}"
+        title = f"#{display_idx} {sub['name']} [{remain_s}] {days}"
         sub_url = str(sub["url"] or "")
         # 本地导入的订阅没有可用的远程链接（uploaded://…），改为发送 Bot 生成的专属订阅地址
         send_url = sub_token_url(sub["token"], "clash") if sub_url.startswith("uploaded://") else sub_url
@@ -3528,9 +4069,15 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 input_message_content=InputTextMessageContent(truncate_utf16(send_url, TG_MESSAGE_LIMIT)),
             )
         )
-    for t in await store.list_temp(user_id):
+
+    parsed_iq = parse_search_query(raw_query)
+    temp_rows = await store.list_temp(user_id) if not parsed_iq.required_statuses else []
+    temp_include = parsed_iq.include_terms + [lit for lit, _ in parsed_iq.soft_status_terms]
+    for t in temp_rows:
         blob = f"{t['name']} {t['url']}".lower()
-        if q and q not in blob:
+        if any(term not in blob for term in temp_include):
+            continue
+        if any(ex in blob for ex in parsed_iq.exclude_terms):
             continue
         results.append(
             InlineQueryResultArticle(
@@ -3580,8 +4127,8 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand("temp", "🧪 管理临时节点"),
     BotCommand("recycle", "♻️ 查看回收站"),
     BotCommand("path", "🧭 节点路径名称映射"),
-    BotCommand("s", "🔍 搜索订阅 (/s 关键词)"),
-    BotCommand("o", "📦 导出搜索结果 (/o 关键词)"),
+    BotCommand("s", "🔍 搜索订阅（支持多词/节点/状态）"),
+    BotCommand("o", "📦 聚合导出搜索结果 (/o 关键词)"),
     BotCommand("d", "🗑 批量删除匹配订阅 (/d 关键词)"),
     BotCommand("i", "🔀 切换排序方式 (默认/流量/到期/名称)"),
     BotCommand("g", "🔎 搜索 GitHub 开源仓库与代码"),

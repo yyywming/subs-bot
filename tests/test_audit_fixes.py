@@ -418,6 +418,7 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
 
         for cb_data, expected_substr in (
             ("menu:list", "订阅列表"),
+            ("menu:search", "搜索订阅"),
             ("menu:expire", "临期列表"),
             ("menu:export", "导出完成"),
             ("menu:updateall", "批量更新"),
